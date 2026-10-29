@@ -598,6 +598,11 @@ def _real_length(pair_mask, num_residues):
   return jnp.where(n > 0, n, jnp.float32(num_residues))
 
 
+def _wide(dtype):
+  """float32 for a float16 triangle contraction, whose sums of N products overflow it (NaN at center_norm), else None."""
+  return jnp.float32 if dtype == jnp.float16 else None
+
+
 class TriangleMultiplication(hk.Module):
   """Triangle Multiplication."""
 
@@ -690,7 +695,7 @@ class TriangleMultiplication(hk.Module):
     # model_config.TRIANGLE_MUL_DIVIDE_BY_LENGTH for the measurement.
     if self.global_config.model in model_config.TRIANGLE_MUL_DIVIDE_BY_LENGTH:
       act = act / _real_length(mask[0], num_residues).astype(act.dtype)
-    act = hm.LayerNorm(name='center_norm', axis=0, param_axis=0)(act)
+    act = hm.LayerNorm(name='center_norm', axis=0, param_axis=0)(act).astype(input_act.dtype)
 
     act = jnp.transpose(act, (1, 2, 0))
     act = hm.Linear(
@@ -766,10 +771,11 @@ class TriangleMultiplication(hk.Module):
                                + bg.astype(act.dtype)[:, None, None]) * mask)
 
     def body(i, out):
-      block = jnp.einsum(equation, gated(wa[i], ga[i], ba[i], gba[i]), gated(wb[i], gb[i], bb[i], gbb[i]))
+      block = jnp.einsum(equation, gated(wa[i], ga[i], ba[i], gba[i]), gated(wb[i], gb[i], bb[i], gbb[i]),
+                         preferred_element_type=_wide(act.dtype))
       return jax.lax.dynamic_update_slice(out, block.astype(out.dtype), (i * cb, 0, 0))
 
-    return jax.lax.fori_loop(0, nb, body, jnp.zeros((hidden_dim, n, n), act.dtype))
+    return jax.lax.fori_loop(0, nb, body, jnp.zeros((hidden_dim, n, n), _wide(act.dtype) or act.dtype))
 
   @hk.transparent
   def _einsum(self, act, mask, hidden_dim, equation, glu_ops=None, biased=False):
@@ -798,7 +804,7 @@ class TriangleMultiplication(hk.Module):
             act, weights_projection, weights_gate, mask[0]
         )
       if ab is not None:
-        return jnp.einsum(equation, *ab)
+        return jnp.einsum(equation, *ab, preferred_element_type=_wide(act.dtype))
       weights_glu = jnp.stack([weights_gate, weights_projection], axis=1)
 
       projection = tokamax.gated_linear_unit(
@@ -824,7 +830,7 @@ class TriangleMultiplication(hk.Module):
     projection = projection.reshape(hidden_dim, 2, *projection.shape[1:])
     a, b = jnp.split(projection, 2, axis=1)
     a, b = jnp.squeeze(a, axis=1), jnp.squeeze(b, axis=1)
-    return jnp.einsum(equation, a, b)
+    return jnp.einsum(equation, a, b, preferred_element_type=_wide(act.dtype))
 
 
 class OuterProductMean(hk.Module):
