@@ -140,8 +140,13 @@ def _pair_bias(p, z):
   return jnp.moveaxis(b, -1, -3)
 
 
-def _window_attention(p, x, pair, atom_pad, heads):
-  """AttentionPairBiasSlidingWindow: x (N, D), pair (NW, W_Q, W_K, c_z), atom_pad (N,)."""
+def _window_bias(p, pair):
+  """LN(pair) (no offset) -> per-head bias of the atom windows, (NW, H, W_Q, W_K)."""
+  return jnp.moveaxis(_lin(_ln(pair, p['norm_z/weight']), p['proj_z/weight']), -1, 1)
+
+
+def _window_attention(p, x, bias, atom_pad, heads):
+  """AttentionPairBiasSlidingWindow: x (N, D), bias (NW, H, W_Q, W_K) from _window_bias, atom_pad (N,)."""
   n, d = x.shape
   hd = d // heads
   qkv = _lin(x, p['proj_qkv/weight'])
@@ -152,7 +157,6 @@ def _window_attention(p, x, pair, atom_pad, heads):
   kv = kv.reshape(kv.shape[0], W_K, 2, heads, hd)
   k, v = kv[:, :, 0], kv[:, :, 1]
   g = jax.nn.sigmoid(_lin(x, p['proj_g/weight']))
-  bias = jnp.moveaxis(_lin(_ln(pair, p['norm_z/weight']), p['proj_z/weight']), -1, 1)
   logits = jnp.einsum('wihd,wjhd->whij', q, k) / hd ** 0.5 + bias          # (NW, H, W, K)
   key_mask = _key_windows(atom_pad, fill=False)                             # (NW, K)
   logits = jnp.where(key_mask[:, None, None, :], logits, -INF)
@@ -160,18 +164,18 @@ def _window_attention(p, x, pair, atom_pad, heads):
   return _lin(g * o, p['proj_o/weight'])
 
 
-def _conditioned_layer(p, x, pair, c, mask, heads, windowed, lns=1.0):
-  """ConditionedTransformerLayer: x + gamma * op(lns * ((1 + alpha) LN x + beta)), twice."""
+def _conditioned_layer(p, x, bias, c, mask, heads, windowed, lns=1.0):
+  """ConditionedTransformerLayer: x + gamma * op(lns * ((1 + alpha) LN x + beta)), twice; bias is the attention's
+  pair bias (_window_bias or _pair_bias)."""
   cond = _lin(jax.nn.silu(_ln(c, p['cond_0/weight'], p['cond_0/bias'])),
               p['cond_2/weight'], p['cond_2/bias'])
   a_al, a_be, a_ga, m_al, m_be, m_ga = jnp.split(cond, 6, axis=-1)
   h = lns * _ada_ln(x, a_al, a_be)
   if windowed:
     h = _window_attention(_sub(p, 'attention/attention_layer/pair_bias_attn'),
-                          h, pair, mask, heads)
+                          h, bias, mask, heads)
   else:
-    h = _attention(_sub(p, 'attention/pair_bias_attn'), h,
-                   _pair_bias(_sub(p, 'attention/pair_bias_attn'), pair), mask, heads)
+    h = _attention(_sub(p, 'attention/pair_bias_attn'), h, bias, mask, heads)
   x = x + a_ga * h
   h = _transition(_sub(p, 'transition'), lns * _ada_ln(x, m_al, m_be), norm=False)
   return x + m_ga * h
@@ -385,8 +389,9 @@ class BioEmu2(hk.Module):
     pr = _atom_pair_tail(p, c, pr)
     q = c
     for i in range(3):
-      q = _conditioned_layer(_sub(p, f'atom_encoder_layers_{i}/transformer_layer'),
-                             q, pr, c, pad, heads=4, windowed=True)
+      lp = _sub(p, f'atom_encoder_layers_{i}/transformer_layer')
+      q = _conditioned_layer(lp, q, _window_bias(_sub(lp, 'attention/attention_layer/pair_bias_attn'), pr),
+                             c, pad, heads=4, windowed=True)
     num_tokens = f['res_type'].shape[0]
     a = _mean_atoms_to_tokens(jax.nn.relu(_lin(q, p['atom_to_token_trans_0/weight'])),
                               f['token_idx_at_atom'], pad, num_tokens)
@@ -467,7 +472,12 @@ class BioEmu2(hk.Module):
                   pa['z_to_p_trans_1/weight'])
     pr = pr + _token_pair_to_windows(z_to_p, f['token_idx_at_atom'], pad)
     pr = _atom_pair_tail(pa, c, pr)
-    return {'z': z, 'q0': q0, 'p': pr}
+    # every layer's attention pair biases, which do not depend on the coordinates: once per fold, not per step
+    lp = _sub(p, 'layers')
+    biases = jax.lax.map(lambda l: (
+        _window_bias(_sub(l, 'atom_block/transformer_layer/attention/attention_layer/pair_bias_attn'), pr),
+        _pair_bias(_sub(l, 'token_block/attention/pair_bias_attn'), z)), lp)
+    return {'z': z, 'q0': q0, 'p': pr, 'biases': biases}
 
   def denoise(self, f, ctx, s_inputs, s_trunk, coords, sigma):
     """One denoiser call: noisy coords (N, 3) in angstrom at noise level sigma ->
@@ -513,11 +523,11 @@ class BioEmu2(hk.Module):
 
     c_to_q = _tokens_to_atoms(cond, atom_tok, pad)
 
-    def layer(carry, lp):
-      a, q = carry
-      q = _conditioned_layer(_sub(lp, 'atom_block/transformer_layer'), q, ctx['p'], c_to_q,
+    def layer(carry, xs):
+      (a, q), (lp, (atom_bias, token_bias)) = carry, xs
+      q = _conditioned_layer(_sub(lp, 'atom_block/transformer_layer'), q, atom_bias, c_to_q,
                              pad, heads=4, windowed=True)
-      a = _conditioned_layer(_sub(lp, 'token_block'), a, ctx['z'], cond, tpad,
+      a = _conditioned_layer(_sub(lp, 'token_block'), a, token_bias, cond, tpad,
                              heads=16, windowed=False)
       cp = _sub(lp, 'coupling')
       d_a, d_q = a.shape[-1], q.shape[-1]
@@ -534,7 +544,7 @@ class BioEmu2(hk.Module):
       q_to_s = jnp.concatenate([_centre_atoms_to_tokens(q, centre, tpad), a], -1)
       q_to_s = ga_s * _transition(_sub(cp, 'q_to_s_mixer'), _ada_ln(q_to_s, al_s, be_s), norm=False)
       return (a + q_to_s, q + s_to_q), None
-    (a, q), _ = jax.lax.scan(layer, (a, q), _sub(p, 'layers'))
+    (a, q), _ = jax.lax.scan(layer, (a, q), (_sub(p, 'layers'), ctx['biases']))
 
     pr = _sub(p, 'readout')
     h = _lin(q, pr['q_to_hidden/weight']) + _tokens_to_atoms(

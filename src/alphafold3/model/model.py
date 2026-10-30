@@ -861,10 +861,10 @@ class Model(hk.Module):
         ctx = b.static_context(f, c['single'], c['pair'])
         init, levels = diffusion_head.sample_init(_Info, key, config, self.global_config)
         return {'init': init, 'noise_levels': levels, 'pair_cond': ctx['z'],
-                'atom_cond': {'q0': ctx['q0'], 'p': ctx['p']}}
+                'atom_cond': {k: v for k, v in ctx.items() if k != 'z'}}
       if stage == 'denoise':
         dcarry, noise_level, pair_cond, atom_cond = diffusion_state
-        ctx = {'z': pair_cond, 'q0': atom_cond['q0'], 'p': atom_cond['p']}
+        ctx = {'z': pair_cond, **atom_cond}
         body = diffusion_head.make_denoising_body(
             denoising_step_for(ctx, c['s_inputs'], c['single']), mask, config,
             self.global_config, False)
