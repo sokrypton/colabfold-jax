@@ -54,8 +54,11 @@ def _ln(x, w=None, b=None, eps=1e-5):
 
 
 def _lin(x, w, b=None):
-  """nn.Linear with a torch-layout (out, in) weight."""
-  y = jnp.einsum('...i,oi->...o', x, w)
+  """nn.Linear with a torch-layout (out, in) weight; a bfloat16 weight takes x in bfloat16, accumulating in float32."""
+  if w.dtype == jnp.bfloat16:
+    y = jnp.einsum('...i,oi->...o', x.astype(w.dtype), w, preferred_element_type=jnp.float32)
+  else:
+    y = jnp.einsum('...i,oi->...o', x, w)
   return y if b is None else y + b
 
 
@@ -477,7 +480,14 @@ class BioEmu2(hk.Module):
     biases = jax.lax.map(lambda l: (
         _window_bias(_sub(l, 'atom_block/transformer_layer/attention/attention_layer/pair_bias_attn'), pr),
         _pair_bias(_sub(l, 'token_block/attention/pair_bias_attn'), z)), lp)
-    return {'z': z, 'q0': q0, 'p': pr, 'biases': biases}
+    ctx = {'z': z, 'q0': q0, 'p': pr, 'biases': biases}
+    from alphafold3.model.network import modules  # pylint: disable=g-import-not-at-top
+    c = z_trunk.shape[-1]
+    if modules.GLU_TRANSITION is not None and modules.GLU_TRANSITION(jnp.bfloat16, c, 4 * c) is not None:
+      # where the trunk's bfloat16 kernels run (not float16 sm_70/75) the layers' matrices do too (_lin), cast once
+      ctx['layers16'] = {k: v.astype(jnp.bfloat16) for k, v in lp.items()
+                         if v.ndim == 3 and k.endswith('/weight') and '/norm_z/' not in k and '/proj_z/' not in k}
+    return ctx
 
   def denoise(self, f, ctx, s_inputs, s_trunk, coords, sigma):
     """One denoiser call: noisy coords (N, 3) in angstrom at noise level sigma ->
@@ -544,7 +554,8 @@ class BioEmu2(hk.Module):
       q_to_s = jnp.concatenate([_centre_atoms_to_tokens(q, centre, tpad), a], -1)
       q_to_s = ga_s * _transition(_sub(cp, 'q_to_s_mixer'), _ada_ln(q_to_s, al_s, be_s), norm=False)
       return (a + q_to_s, q + s_to_q), None
-    (a, q), _ = jax.lax.scan(layer, (a, q), (_sub(p, 'layers'), ctx['biases']))
+    layers = {**_sub(p, 'layers'), **ctx.get('layers16', {})}
+    (a, q), _ = jax.lax.scan(layer, (a, q), (layers, ctx['biases']))
 
     pr = _sub(p, 'readout')
     h = _lin(q, pr['q_to_hidden/weight']) + _tokens_to_atoms(
