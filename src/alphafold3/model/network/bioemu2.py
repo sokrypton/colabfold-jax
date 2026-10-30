@@ -181,6 +181,11 @@ def _conditioned_layer(p, x, pair, c, mask, heads, windowed, lns=1.0):
 
 def _trimul(p, z, pair_mask, outgoing):
   """Boltz-2 triangle multiplication (TriangleMultiplicationFull)."""
+  from alphafold3.model.network import modules  # pylint: disable=g-import-not-at-top
+  c = z.shape[-1]
+  kernels = None if modules.TRIMUL_KERNELS is None else modules.TRIMUL_KERNELS(jnp.bfloat16, c, c)
+  if kernels is not None:
+    return _fused_trimul(p, z, pair_mask, outgoing, kernels, modules.PAD_KEEP)
   zn = _ln(z, p['norm_in/weight'], p['norm_in/bias'])
   proj = _lin(zn, p['p_in/weight']) * jax.nn.sigmoid(_lin(zn, p['g_in/weight']))
   proj = jnp.where(pair_mask[..., None], proj, 0.0)
@@ -222,14 +227,44 @@ def _msa_layer(p, z, m, pair_mask, msa_mask):
   z = z + _outer_product_mean(_sub(p, 'outer_product_mean'), m, msa_mask)
   z = z + _trimul(_sub(p, 'tri_mul_out'), z, pair_mask, True)
   z = z + _trimul(_sub(p, 'tri_mul_in'), z, pair_mask, False)
-  z = z + _transition(_sub(p, 'z_transition'), z)
+  z = z + _pair_transition(_sub(p, 'z_transition'), z)
   return z, m
+
+
+def _fused_trimul(p, z, pair_mask, outgoing, kernels, pad_keep):
+  """_trimul's update through the AF3 graph's fused kernels (modules.TRIMUL_KERNELS) in bfloat16; z stays float32.
+  Incoming edges contract a over rows ('kid,kjd'), the AF3 form ('ckj,cki') with the halves swapped."""
+  contract, epilogue = kernels
+  n, c = z.shape[0], z.shape[-1]
+  x, mask = z.astype(jnp.bfloat16), pair_mask.astype(jnp.bfloat16)
+  w = lambda k: p[k].T.astype(jnp.bfloat16)                       # torch (out, in) -> (in, out)
+  ab = (lambda m: m) if outgoing else (lambda m: jnp.concatenate([m[:, c:], m[:, :c]], axis=1))
+  zero = jnp.zeros((2 * c,), jnp.bfloat16)
+  tri = contract(x, p['norm_in/weight'], p['norm_in/bias'], ab(w('p_in/weight')), zero, ab(w('g_in/weight')), zero,
+                 mask, equation='cik,cjk->cij' if outgoing else 'ckj,cki->cij')
+  keep = [mask.reshape(-1)] if pad_keep else []
+  out = epilogue(tri.reshape(c, -1), x.reshape(-1, c), p['norm_in/weight'], p['norm_in/bias'], p['norm_out/weight'],
+                 p['norm_out/bias'], w('p_out/weight'), zero[:c], w('g_out/weight'), zero[:c], *keep)
+  return out.reshape(n, n, c).astype(z.dtype)
+
+
+def _pair_transition(p, z):
+  """_transition of the pair, through the AF3 graph's fused SwiGLU kernel (modules.GLU_TRANSITION) in bfloat16 when
+  ColabFold installed it; z stays float32."""
+  from alphafold3.model.network import modules  # pylint: disable=g-import-not-at-top
+  c, h = z.shape[-1], p['fc1/weight'].shape[0]
+  glu = None if modules.GLU_TRANSITION is None else modules.GLU_TRANSITION(jnp.bfloat16, c, h)
+  if glu is None:
+    return _transition(p, z)
+  w = lambda k: p[k].T.astype(jnp.bfloat16)
+  return glu(z.astype(jnp.bfloat16), p['norm/weight'], p['norm/bias'], w('fc1/weight'), w('fc2/weight'),
+             w('fc3/weight')).astype(z.dtype)
 
 
 def _pairmixer_layer(p, z, pair_mask):
   z = z + _trimul(_sub(p, 'tri_mul_out'), z, pair_mask, True)
   z = z + _trimul(_sub(p, 'tri_mul_in'), z, pair_mask, False)
-  return z + _transition(_sub(p, 'transition_z'), z)
+  return z + _pair_transition(_sub(p, 'transition_z'), z)
 
 
 def _relpos(p, f, r_max=32, s_max=2):
