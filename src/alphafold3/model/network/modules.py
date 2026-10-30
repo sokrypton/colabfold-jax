@@ -652,12 +652,12 @@ class TriangleMultiplication(hk.Module):
     cb = self.config.channel_block
     blocked = cb and hidden_dim % cb == 0 and num_residues ** 2 * hidden_dim * 8 > TRIMUL_BLOCK_BYTES
     # helixfold3's six Linears carry trained biases (model_config.TRIMUL_BIAS),
-    # which no fused or GLU kernel takes: they run the plain einsum
+    # which the fused kernels take; the GLU kernels do not: those run the plain einsum
     biased = self.global_config.model in model_config.TRIMUL_BIAS
-    if TRIMUL_KERNELS is not None and not blocked and not biased:
+    if TRIMUL_KERNELS is not None and not blocked:
       kernels = TRIMUL_KERNELS(act.dtype, num_channels, hidden_dim)
       if kernels is not None:
-        return self._fused(act, mask[0], hidden_dim, equation, kernels, residual)
+        return self._fused(act, mask[0], hidden_dim, equation, kernels, residual, biased)
 
     # A pre-Ampere card (T4, V100) can launch none of the fused kernels this
     # module reaches for -- tokamax's GLU included -- so on `volta` the input
@@ -717,30 +717,33 @@ class TriangleMultiplication(hk.Module):
     return act if residual is None else residual + act
 
   @hk.transparent
-  def _fused(self, act, mask, hidden_dim, equation, kernels, residual):
+  def _fused(self, act, mask, hidden_dim, equation, kernels, residual, biased=False):
     """Kernels around the einsum that each run left_norm_input, so the normed pair is never written."""
     contract, epilogue = kernels
     n, c = act.shape[0], act.shape[-1]
     in_ln = _layer_norm_params('left_norm_input', c)
-    wp, _ = hm.haiku_linear_get_params(act, num_output=hidden_dim * 2, name='projection')
-    wg, _ = hm.haiku_linear_get_params(act, num_output=hidden_dim * 2, initializer=self.global_config.final_init,
-                                       name='gate')
-    # output channel 2c is a[c] and 2c + 1 is b[c]: regroup as [a | b], the kernel's split
-    ab = lambda w: jnp.concatenate([w[:, 0::2], w[:, 1::2]], axis=1).astype(act.dtype)
+    wp, bp = hm.haiku_linear_get_params(act, num_output=hidden_dim * 2, use_bias=biased, name='projection')
+    wg, bg = hm.haiku_linear_get_params(act, num_output=hidden_dim * 2, use_bias=biased, bias_init=1.0,
+                                        initializer=self.global_config.final_init, name='gate')
+    # output channel 2c is a[c] and 2c + 1 is b[c]: regroup as [a | b], the kernel's split; no bias is zeros
+    ab = lambda w: jnp.concatenate([w[..., 0::2], w[..., 1::2]], axis=-1).astype(act.dtype)
     zero = jnp.zeros((hidden_dim * 2,), act.dtype)
-    tri = contract(act, *in_ln, ab(wp), zero, ab(wg), zero, mask.astype(act.dtype), equation=equation)
+    bp, bg = (zero, zero) if bp is None else (ab(bp), ab(bg))
+    tri = contract(act, *in_ln, ab(wp), bp, ab(wg), bg, mask.astype(act.dtype), equation=equation)
     if self.global_config.model in model_config.TRIANGLE_MUL_DIVIDE_BY_LENGTH:
       tri = tri / _real_length(mask, n).astype(tri.dtype)  # rf3, as in __call__
 
     final = self.global_config.final_init
     ln = _layer_norm_params('center_norm', hidden_dim)
-    wo, _ = hm.haiku_linear_get_params(jax.ShapeDtypeStruct((hidden_dim,), act.dtype), num_output=c,
-                                       initializer=final, name='output_projection')
-    wgo, _ = hm.haiku_linear_get_params(act, num_output=c, initializer=final, name='gating_linear')
+    wo, bo = hm.haiku_linear_get_params(jax.ShapeDtypeStruct((hidden_dim,), act.dtype), num_output=c,
+                                        use_bias=biased, initializer=final, name='output_projection')
+    wgo, bgo = hm.haiku_linear_get_params(act, num_output=c, use_bias=biased, bias_init=1.0, initializer=final,
+                                          name='gating_linear')
     zero = jnp.zeros((c,), act.dtype)
+    bo, bgo = (zero, zero) if bo is None else (bo.astype(act.dtype), bgo.astype(act.dtype))
     keep = [mask.astype(act.dtype).reshape(-1)] if PAD_KEEP else []
-    out = epilogue(tri.reshape(hidden_dim, -1), act.reshape(-1, c), *in_ln, *ln, wo.astype(act.dtype), zero,
-                   wgo.astype(act.dtype), zero, *keep, add_input=residual is act).reshape(act.shape)
+    out = epilogue(tri.reshape(hidden_dim, -1), act.reshape(-1, c), *in_ln, *ln, wo.astype(act.dtype), bo,
+                   wgo.astype(act.dtype), bgo, *keep, add_input=residual is act).reshape(act.shape)
     return out if residual is None or residual is act else residual + out
 
   @hk.transparent
