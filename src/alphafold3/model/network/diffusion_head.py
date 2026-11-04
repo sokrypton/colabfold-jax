@@ -41,6 +41,17 @@ import numpy as np
 # Carefully measured by averaging multimer training set.
 SIGMA_DATA = 16.0
 
+# above SPLIT token pairs the pair conditioning is built in row slabs of at most SLAB pairs (151 GB unsplit at 6k)
+PAIR_COND_SPLIT, PAIR_COND_SLAB = 1 << 22, 1 << 18
+
+
+def _pair_slab(n):
+  """rows per slab of the pair conditioning: n (unsplit) up to PAIR_COND_SPLIT pairs, else the largest divisor of n
+  that keeps a slab within PAIR_COND_SLAB pairs"""
+  if n * n <= PAIR_COND_SPLIT:
+    return n
+  return max(d for d in range(1, max(1, PAIR_COND_SLAB // n) + 1) if n % d == 0)
+
 
 def random_rotation(key):
   # Create a random rotation (Gram-Schmidt orthogonalization of two
@@ -237,9 +248,12 @@ class DiffusionHead(hk.Module):
     want_pair = parts in ('both', 'pair')
     want_single = parts in ('both', 'single')
     single_embedding = use_conditioning * embeddings['single']
-    pair_embedding = use_conditioning * embeddings['pair']
+    pair_full = use_conditioning * embeddings['pair']
 
-    if want_pair:
+    def pair_rows(rows):
+      # the pair conditioning of query rows `rows` (token indices, contiguous), or of all of them for None
+      take = lambda x: x if rows is None else jax.lax.dynamic_slice_in_dim(x, rows[0], rows.shape[0])
+      pair_embedding = take(pair_full)
       rel_features = featurization.create_relative_encoding(
           seq_features=batch.token_features,
           max_relative_idx=32,
@@ -265,6 +279,7 @@ class DiffusionHead(hk.Module):
           rel_pos_same_residue=(
               self.global_config.model
               in model_config.RELPOS_SAME_RESIDUE_INDEX),
+          rows=rows,
       ).astype(pair_embedding.dtype)
       pc = self.config.conditioning.pair_channel
       if self.global_config.model == 'opendde':
@@ -295,7 +310,7 @@ class DiffusionHead(hk.Module):
         # SINGLE track concatenates the other way round, which is why the
         # converter swaps that weight's halves and not this one.
         features_2d = jnp.concatenate(
-            [pair_embedding, embeddings['pair_init'].astype(pair_embedding.dtype)],
+            [pair_embedding, take(embeddings['pair_init']).astype(pair_embedding.dtype)],
             axis=-1)
       else:
         features_2d = jnp.concatenate([pair_embedding, rel_features], axis=-1)
@@ -325,6 +340,18 @@ class DiffusionHead(hk.Module):
         # applied with the single half below.
         pair_cond = hm.LayerNorm(use_fast_variance=False,
                                  name='pair_cond_final_norm')(pair_cond)
+      return pair_cond
+
+    if want_pair:
+      n = pair_full.shape[0]
+      slab = _pair_slab(n)
+      if slab == n or hk.running_init():
+        pair_cond = pair_rows(None)
+      else:
+        # row slabs, each stored in the sampler's dtype: whole, the f32 transition hidden is pairs x 1024 x 4 B
+        dtype = utils.compute_dtype(self.global_config, sampler=True)
+        pair_cond = hk.map(lambda s: pair_rows(s + jnp.arange(slab)).astype(dtype),
+                           jnp.arange(0, n, slab)).reshape(n, n, -1)
     else:
       pair_cond = None
 

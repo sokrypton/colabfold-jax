@@ -510,8 +510,9 @@ def create_relative_encoding(
     max_relative_chain: int,
     chain_bucket_on_same_chain: bool = False,
     rel_pos_same_residue: bool = False,
+    rows: jax.Array | None = None,
 ) -> jax.Array:
-  """Add relative position encodings.
+  """Add relative position encodings; `rows` (token indices) builds only those query rows.
 
   `rel_pos_same_residue` gates the relative-position block on an equal residue
   index in ANY chain instead of on the same chain (HelixFold3's
@@ -535,20 +536,21 @@ def create_relative_encoding(
   asym_id = seq_features.asym_id
   entity_id = seq_features.entity_id
   sym_id = seq_features.sym_id
+  left = lambda x: (x if rows is None else x[rows])[:, None]
 
-  left_asym_id = asym_id[:, None]
+  left_asym_id = left(asym_id)
   right_asym_id = asym_id[None, :]
 
-  left_residue_index = residue_index[:, None]
+  left_residue_index = left(residue_index)
   right_residue_index = residue_index[None, :]
 
-  left_token_index = token_index[:, None]
+  left_token_index = left(token_index)
   right_token_index = token_index[None, :]
 
-  left_entity_id = entity_id[:, None]
+  left_entity_id = left(entity_id)
   right_entity_id = entity_id[None, :]
 
-  left_sym_id = sym_id[:, None]
+  left_sym_id = left(sym_id)
   right_sym_id = sym_id[None, :]
 
   # Embed relative positions using a one-hot embedding of distance along chain
