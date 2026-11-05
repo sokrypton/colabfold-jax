@@ -58,7 +58,7 @@ class DistogramHead(hk.Module):
       embeddings: dict[str, jnp.ndarray],
       return_distogram: bool = False,
   ) -> dict[str, jnp.ndarray]:
-    pair_act = embeddings['pair']
+    pair_act = embeddings['pair'].astype(jnp.float32)
     seq_mask = batch.token_features.mask.astype(bool)
     pair_mask = seq_mask[:, None] * seq_mask[None, :]
 

@@ -19,6 +19,8 @@
 
 """Modules for embedding templates."""
 
+import contextlib
+
 from alphafold3.common import base_config
 from alphafold3.constants import residue_names
 from alphafold3.jax import geometry
@@ -115,6 +117,10 @@ def make_backbone_rigid(
   rigid = geometry.Rigid3Array(rotation, frame_positions[1])  # pyrefly: ignore[bad-argument-count]
 
   return rigid, rigid_mask
+
+
+# a fused template embedder above this many bytes of [T, N, N, C] stack embeds its slots one at a time
+TEMPLATE_VMAP_BYTES = 4 * 2 ** 30
 
 
 class _Shared(hk.Module):
@@ -616,9 +622,29 @@ class Boltz2TemplateEmbedding(hk.Module):
                      self.module_name)
     embed = lambda s: shared(s)                                         # (T,N,N,64)
     lazy = not hk.running_init()
+    present = (atom_mask.reshape(T, -1).sum(-1) > 0)                     # (T,)
+    mean_all = self.global_config.model in model_config.TEMPLATE_MEAN_OVER_ALL_SLOTS
 
     def project(u):
       return hm.Linear(z.shape[-1], use_bias=False, name='u_proj')(jax.nn.relu(u)).astype(dtype)
+
+    if lazy and T * N * N * c.num_channels * jnp.dtype(dtype).itemsize > TEMPLATE_VMAP_BYTES:
+      # one slot at a time, reusing a repeated slot's embedding (the vmap holds all: 4 x 4.7 GB at 6k tokens); the
+      # vmap's two key draws are kept, and each slot draws its own dropout keys from base
+      base = hk.maybe_next_rng_key() if c.template_stack.num_layer else None
+      if base is not None:
+        hk.maybe_next_rng_key()
+      one = _Shared(lambda x: per_template(*x[:4]) * x[4].astype(dtype), self.module_name)
+      zero = jnp.zeros((N, N, c.num_channels), jnp.float32)
+      weights = jnp.ones((T,), dtype) if mean_all else present.astype(dtype)
+
+      def summed(_):
+        with hk.with_rng(base) if base is not None else contextlib.nullcontext():
+          total = _sum_slots(one, slots + (weights,), zero, True, c.template_stack.num_layer).astype(dtype)
+        return project(total / ((1e-7 + T) if mean_all else jnp.clip(weights.sum(), 1.0, None)))
+      if mean_all:
+        return summed(0)
+      return hk.cond(present.any(), summed, lambda _: jnp.zeros(z.shape, dtype), 0)
 
     if self.global_config.model in model_config.TEMPLATE_MEAN_OVER_ALL_SLOTS:
       # protenix divides by the PADDED slot count and sums every slot, so the
@@ -635,8 +661,6 @@ class Boltz2TemplateEmbedding(hk.Module):
       else:
         v_all = full(0)
       return project(v_all.sum(0) / (1e-7 + T))
-
-    present = (atom_mask.reshape(T, -1).sum(-1) > 0)                     # (T,)
 
     def mean_present(_):
       v_all = embed(slots)

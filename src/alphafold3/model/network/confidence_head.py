@@ -27,6 +27,7 @@ from alphafold3.model.network import featurization
 from alphafold3.model.atom_layout import atom_layout
 from alphafold3.constants import atom_types
 from alphafold3.model.components import haiku_modules as hm
+from alphafold3.model.components import mapping
 from alphafold3.model.components import utils
 from . import atom_cross_attention
 from . import modules
@@ -44,6 +45,9 @@ def _safe_norm(x, keepdims, axis, eps=1e-8):
 # The parity harness's draw for helixfold3's confidence augmentation: (R (3, 3),
 # t (3,)) applied as x @ R + t, as stock's CentreRandomAugmentation; None in a run.
 HF3_CONF_AUGMENT = None
+
+# float32 pair copies larger than this feed the pair logit heads in row slabs (35 GiB at 6k tokens, 256 channels)
+PAIR_LOGIT_SLAB_BYTES = 2 ** 30
 
 class ConfidenceHead(hk.Module):
   """Head to predict the distance errors in a prediction."""
@@ -99,10 +103,30 @@ class ConfidenceHead(hk.Module):
     `<head>/~_head_norm/logits_ln` and every already-converted model (of3/if2/rf3/
     protenix) silently loses 8 parameters to init. Caught by the structural gate.
     """
+    norm = self._head_norm_module(name)
+    return x if norm is None else norm(x)
+
+  @hk.transparent
+  def _head_norm_module(self, name):
     skip = model_config.NO_HEAD_NORM.get(self.global_config.model, ())
-    if '*' in skip or name in skip:
-      return x
-    return hm.LayerNorm(name=name)(x)
+    return None if '*' in skip or name in skip else hm.LayerNorm(name=name)
+
+  def _pair_logits(self, pair_act, asym_id, fn, sym=False):
+    """fn(x, asym_rows) over the float32 pair (pair + pair^T when sym), in row slabs when that copy is large.
+
+    Every head here is row-local (LayerNorm and projection over channels), so the slabs are exact. fn must not
+    create modules: inside the slab loop a new module would get a fresh name.
+    """
+    def rows(p, pt, a):
+      x = p.astype(jnp.float32)
+      if sym:
+        x = x + jnp.swapaxes(pt, 0, 1).astype(jnp.float32)
+      return fn(x, a)
+    row_bytes = pair_act[0].size * 4
+    if hk.running_init() or pair_act.shape[0] * row_bytes <= PAIR_LOGIT_SLAB_BYTES:
+      return rows(pair_act, pair_act, asym_id)
+    return mapping.sharded_apply(rows, max(1, PAIR_LOGIT_SLAB_BYTES // row_bytes), in_axes=(0, 1, 0))(
+        pair_act, pair_act, asym_id)
 
   @hk.transparent
   def _boltz2_rel_pos(self, tf, num_channels, dtype):
@@ -153,19 +177,31 @@ class ConfidenceHead(hk.Module):
         contact, threshold, num_channels, dtype)
 
   @hk.transparent
-  def _boltz2_split_heads(self, z, asym_id, num_bins, intra_name, inter_name):
+  def _boltz2_split_heads(self, asym_id, num_bins, intra_name, inter_name):
     """boltz2's intra/inter-chain logit pair: `intra(z)*same + inter(z)*different`.
 
     Not a blend -- the two are disjoint hard masks, so on a monomer this reduces
     exactly to the intra head and the inter weights are dead. That is the whole reason
     the monomer gate could not see the missing head.
+
+    Returns fn(z, asym_rows) for `_pair_logits`, z holding the rows of asym_rows.
     """
-    same_chain = (asym_id[:, None] == asym_id[None])[..., None].astype(z.dtype)
     intra = hm.Linear(num_bins, initializer=self.global_config.final_init,
-                      name=intra_name)(z)
+                      name=intra_name)
     inter = hm.Linear(num_bins, initializer=self.global_config.final_init,
-                      name=inter_name)(z)
-    return intra * same_chain + inter * (1 - same_chain)
+                      name=inter_name)
+
+    def fn(z, asym_rows):
+      same_chain = (asym_rows[:, None] == asym_id[None])[..., None].astype(z.dtype)
+      return intra(z) * same_chain + inter(z) * (1 - same_chain)
+    return fn
+
+  @hk.transparent
+  def _normed_linear(self, num_bins, norm_name, name, use_bias=False):
+    """fn(x, _) = Linear(head_norm(x)) for `_pair_logits`."""
+    norm = self._head_norm_module(norm_name)
+    lin = hm.Linear(num_bins, use_bias=use_bias, initializer=self.global_config.final_init, name=name)
+    return lambda x, _: lin(x if norm is None else norm(x))
 
   def _boltz2_reembed(self, pair_act, single_act, target_feat, positions, pair_mask,
                       token_features, bond_matrix, bond_type_matrix, batch=None):
@@ -528,7 +564,6 @@ class ConfidenceHead(hk.Module):
         # 1.10e-01 (esmfold2_fast); on z_base + that output they read 1.35e-06
         # and 1.11e-06, rms ratio 1.0000 both.
         pair_act = pair_stack_in + pair_act
-      pair_act = pair_act.astype(jnp.float32)
       if self.global_config.model in model_config.PAIR_ONLY_TRUNK:
         # No trunk single exists, so there is nothing to read: ESMFold2 builds
         # its single by ROW-ATTENTION POOLING the pair -- softmax over j of a
@@ -538,12 +573,13 @@ class ConfidenceHead(hk.Module):
         # (modeling_esmfold2.py ConfidenceHead.forward). Pooling the pre-stack
         # pair instead is a different function, and the heads that read the
         # single are the only ones that can see it.
-        scores = hm.Linear(1, name='row_pool_attn')(pair_act)[..., 0]
+        pair_f32 = pair_act.astype(jnp.float32)
+        scores = hm.Linear(1, name='row_pool_attn')(pair_f32)[..., 0]
         scores = jnp.where(seq_mask_cast[None, :] > 0, scores, -1e9)
         single_act = hm.Linear(
             single_act.shape[-1], name='row_pool_out')(
                 jnp.einsum('nm,nmd->nd', jax.nn.softmax(scores, axis=-1),
-                           pair_act))
+                           pair_f32))
       assert pair_act.shape == (num_residues, num_residues, num_pair_channels)
 
       # Produce logits to predict a distogram of pairwise distance errors
@@ -564,26 +600,18 @@ class ConfidenceHead(hk.Module):
         # both PDE and PAE, each hard-masked to its half of the pair matrix. On a
         # monomer the inter head never fires, which is why the intra head alone was
         # exact on 6MRR and why this needs a complex to validate.
-        distance_logits = self._boltz2_split_heads(
-            pair_act + jnp.swapaxes(pair_act, -2, -3),   # boltz symmetrizes FIRST
-            asym_id, self.config.num_bins,
-            'left_half_distance_logits', 'inter_half_distance_logits')
+        distance_logits = self._pair_logits(  # boltz symmetrizes FIRST
+            pair_act, asym_id, self._boltz2_split_heads(
+                asym_id, self.config.num_bins,
+                'left_half_distance_logits', 'inter_half_distance_logits'), sym=True)
       elif self.global_config.model in model_config.PRE_SYMMETRISED_PDE:
         # protenix normalises the SYMMETRISED pair, so the symmetrisation is
         # inside the LayerNorm rather than outside the projection.
-        distance_logits = hm.Linear(
-            self.config.num_bins,
-            use_bias=hf3,
-            initializer=self.global_config.final_init,
-            name='left_half_distance_logits',
-        )(self._head_norm('logits_ln',
-                          pair_act + jnp.swapaxes(pair_act, -2, -3)))
+        distance_logits = self._pair_logits(pair_act, asym_id, self._normed_linear(
+            self.config.num_bins, 'logits_ln', 'left_half_distance_logits', use_bias=hf3), sym=True)
       else:
-        left_distance_logits = hm.Linear(
-            self.config.num_bins,
-            initializer=self.global_config.final_init,
-            name='left_half_distance_logits',
-        )(self._head_norm('logits_ln', pair_act))
+        left_distance_logits = self._pair_logits(pair_act, asym_id, self._normed_linear(
+            self.config.num_bins, 'logits_ln', 'left_half_distance_logits'))
         if self.global_config.model in model_config.UNSYMMETRISED_PDE:
           # ESMFold2 does not symmetrise at all -- its PDE head is its PAE head
           # with different weights. See model_config.UNSYMMETRISED_PDE.
@@ -621,16 +649,11 @@ class ConfidenceHead(hk.Module):
       pae_outputs = {}
       # Shape (num_res, num_res, num_bins)
       if self.global_config.model == 'boltz2':
-        pae_logits = self._boltz2_split_heads(
-            pair_act, asym_id, self.config.pae.num_bins,
-            'pae_logits', 'pae_inter_logits')
+        pae_logits = self._pair_logits(pair_act, asym_id, self._boltz2_split_heads(
+            asym_id, self.config.pae.num_bins, 'pae_logits', 'pae_inter_logits'))
       else:
-        pae_logits = hm.Linear(
-            self.config.pae.num_bins,
-            use_bias=hf3,
-            initializer=self.global_config.final_init,
-            name='pae_logits',
-        )(self._head_norm('pae_logits_ln', pair_act))
+        pae_logits = self._pair_logits(pair_act, asym_id, self._normed_linear(
+            self.config.pae.num_bins, 'pae_logits_ln', 'pae_logits', use_bias=hf3))
       # Shape (num_bins,)
       pae_breaks = jnp.linspace(
           0.0, self.config.pae.max_error_bin, self.config.pae.num_bins - 1

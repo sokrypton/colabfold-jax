@@ -990,7 +990,7 @@ class Model(hk.Module):
     tf_struct, s_struct, z_struct, attn_bias = (
         structural_tokens.StructuralTokenExpander(c_s, c_z, c_s_inputs, gc)(
             batch_struct, embeddings['target_feat'], embeddings['single'],
-            embeddings['pair']))
+            embeddings['pair'].astype(jnp.float32)))
 
     # 4-block refiner (identical block to the trunk pairformer). n_heads=8 single,
     # tri-att 12 heads via hidden_scale_up, pair transition x2 / single transition x4.
@@ -1142,6 +1142,10 @@ class Model(hk.Module):
     if isinstance(target_feat, tuple):
       target_feat, target_feat_structure = target_feat
 
+    # The pair rides the loop in the trunk's compute dtype: every pass casts it to that dtype before reading it
+    # (evoformer _add_prev), so float32 only held an extra 35 GiB at 6k tokens. Readers after the loop upcast.
+    pair_dtype = utils.compute_dtype(self.global_config)
+
     def recycle_body(_, args):
       prev, key = args
       key, subkey = jax.random.split(key)
@@ -1152,7 +1156,7 @@ class Model(hk.Module):
           key=subkey,
           use_dropout=use_dropout,
       )
-      embeddings['pair'] = embeddings['pair'].astype(jnp.float32)
+      embeddings['pair'] = embeddings['pair'].astype(pair_dtype)
       embeddings['single'] = embeddings['single'].astype(jnp.float32)
       return embeddings, key
 
@@ -1161,7 +1165,7 @@ class Model(hk.Module):
     embeddings = {
         'pair': jnp.zeros(
             [num_res, num_res, self.config.evoformer.pair_channel],
-            dtype=jnp.float32,
+            dtype=pair_dtype,
         ),
         'single': jnp.zeros(
             [num_res, self.config.evoformer.seq_channel], dtype=jnp.float32
@@ -1300,7 +1304,7 @@ class Model(hk.Module):
     output = {'distogram': distogram}
     if self.config.return_embeddings:
       output['single_embeddings'] = embeddings['single']
-      output['pair_embeddings'] = embeddings['pair']
+      output['pair_embeddings'] = embeddings['pair'].astype(jnp.float32)
       # the trunk's INPUTS as well as its outputs, so a port can tell a bad
       # trunk from a bad input embedder without re-running anything
       output['target_feat'] = embeddings['target_feat']
@@ -1399,7 +1403,7 @@ class Model(hk.Module):
         return opendde_confidence.OpenDDEConfidenceHead(
             self.config.evoformer.seq_channel, self.config.evoformer.pair_channel,
             embeddings['target_feat'].shape[-1], self.global_config)(
-                embeddings['target_feat'], embeddings['single'], embeddings['pair'], rep,
+                embeddings['target_feat'], embeddings['single'], embeddings['pair'].astype(jnp.float32), rep,
                 a2t, a2ta, batch.token_features.mask)
       logits = mapping.sharded_map(_conf, in_axes=0)(samples['atom_positions'])
       confidence_output = _opendde_confidence(

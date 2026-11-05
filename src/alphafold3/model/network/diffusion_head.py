@@ -248,12 +248,12 @@ class DiffusionHead(hk.Module):
     want_pair = parts in ('both', 'pair')
     want_single = parts in ('both', 'single')
     single_embedding = use_conditioning * embeddings['single']
-    pair_full = use_conditioning * embeddings['pair']
+    pair_full = embeddings['pair']
 
     def pair_rows(rows):
       # the pair conditioning of query rows `rows` (token indices, contiguous), or of all of them for None
       take = lambda x: x if rows is None else jax.lax.dynamic_slice_in_dim(x, rows[0], rows.shape[0])
-      pair_embedding = take(pair_full)
+      pair_embedding = use_conditioning * take(pair_full).astype(jnp.float32)
       rel_features = featurization.create_relative_encoding(
           seq_features=batch.token_features,
           max_relative_idx=32,
