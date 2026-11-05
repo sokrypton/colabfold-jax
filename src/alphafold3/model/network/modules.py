@@ -37,7 +37,8 @@ import tokamax
 # PACKED_ATTENTION(dtype, head_dim) -> f(p, bias, kmask, gate_bias[, kv], *, sm_scale, column) or None
 PACKED_ATTENTION = None
 # PAIR_PROJECTIONS(dtype, channels, num_head, head_dim) -> (ln_projection, output_projection) or None, around it:
-# ln_projection(x, ln_scale, ln_offset, w, wb) -> (p, bias [h, M], kv or None); output_projection(o, w, b[, residual])
+# ln_projection(x, ln_scale, ln_offset, w, wb[, keep], seq_len=None) -> (p, bias [h, M], kv or None), w None for the bias
+# alone, seq_len the attended length when x is a slab, not the whole pair; output_projection(o, w, b[, residual])
 PAIR_PROJECTIONS = None
 # TRIMUL_KERNELS(dtype, channels, hidden) -> (contract, epilogue) or None, both reading the raw input and its LN params:
 # contract(x, ln_scale, ln_offset, wp, bp, wg, bg, mask, *, equation) -> [hidden, N, N]; epilogue is trimul_epilogue_ln
@@ -410,35 +411,74 @@ class GridSelfAttention(hk.Module):
     return None if kernel is None or projections is None else (kernel, *projections)
 
   @hk.transparent
-  def _ln_projection(self, act, ln_projection, keep=None):
-    """act_norm, q/k/v/gate and the pair bias in one kernel from the raw pair: p [X, Y, G, H, D], bias [H, X, Y]."""
-    x, y, c = act.shape
+  def _projection_params(self, act):
+    """_ln_projection's act_norm (scale, offset), pair_bias_projection, q/k/v/gate and gate bias."""
+    c = act.shape[-1]
     h = self.config.num_head
     d = self.config.qkv_dim or max(c // h, 16)
     ln = _layer_norm_params('act_norm', c)
     wb, _ = hm.haiku_linear_get_params(act, num_output=h, name='pair_bias_projection')
-    w, gb = self._qkvg_weights(act, h, d)
+    return (ln, wb, *self._qkvg_weights(act, h, d))
+
+  @hk.transparent
+  def _output_params(self, act, h, d):
+    """output_projection's weight and bias, for _ln_packed_attention."""
+    wo, bo = hm.haiku_linear_get_params(jax.ShapeDtypeStruct((h * d,), act.dtype), num_output=act.shape[-1],
+                                        use_bias=self.global_config.model in model_config.TRI_ATT_BIAS,
+                                        initializer=self.global_config.final_init, name='output_projection')
+    return wo, jnp.zeros((act.shape[-1],), act.dtype) if bo is None else bo.astype(act.dtype)
+
+  @hk.transparent
+  def _ln_projection(self, act, ln_projection, keep=None, params=None, seq_len=None):
+    """act_norm, q/k/v/gate and the pair bias in one kernel from the raw pair: p [X, Y, G, H, D], bias [H, X, Y]."""
+    x, y, c = act.shape
+    h = self.config.num_head
+    d = self.config.qkv_dim or max(c // h, 16)
+    ln, wb, w, gb = params or self._projection_params(act)
     p, bias, kv = ln_projection(act.reshape(-1, c), *ln, jnp.moveaxis(w, 1, 0).reshape(4, c, h * d),
-                                wb.astype(act.dtype), *([] if keep is None else [keep.reshape(-1)]))
+                                wb.astype(act.dtype), *([] if keep is None else [keep.reshape(-1)]),
+                                **({} if seq_len is None else {'seq_len': seq_len}))
     kv = None if kv is None else kv.reshape(x, y, 2, h, d)
     return p.reshape(x, y, -1, h, d), bias.reshape(h, x, y), kv, gb
 
   @hk.transparent
-  def _ln_packed_attention(self, act, p, bias, kv, gb, kmask, kernels, residual, keep=None):
+  def _ln_packed_attention(self, act, p, bias, kv, gb, kmask, kernels, residual, keep=None, out_params=None):
     """The packed kernel on _ln_projection's output, then output_projection with the residual in one kernel."""
     attention, _, output_projection = kernels
     x, y, c = act.shape
     h, d = p.shape[-2:]
     out = attention(p, bias, kmask.astype(jnp.bool_), gb, *([] if kv is None else [kv]), sm_scale=d ** -0.5,
                     column=self.transpose)
-    wo, bo = hm.haiku_linear_get_params(jax.ShapeDtypeStruct((h * d,), act.dtype), num_output=c,
-                                        use_bias=self.global_config.model in model_config.TRI_ATT_BIAS,
-                                        initializer=self.global_config.final_init, name='output_projection')
-    bo = jnp.zeros((c,), act.dtype) if bo is None else bo.astype(act.dtype)
+    wo, bo = out_params or self._output_params(act, h, d)
     res = [] if residual is None else [residual.reshape(-1, c)]
     if keep is not None:
       res = (res or [None]) + [keep.reshape(-1)]
     return output_projection(out.reshape(-1, h * d), wo.astype(act.dtype), bo, *res).reshape(x, y, c)
+
+  @hk.transparent
+  def _pair_bias(self, act, ln_projection, params, keep=None):
+    """act_norm and pair_bias_projection [H, X, Y] alone, ln_projection without the packed slots: the slabs below need
+    the bias whole, and it is a fraction of the pair."""
+    x, y, c = act.shape
+    ln, wb = params[:2]
+    _, bias, _ = ln_projection(act.reshape(-1, c), *ln, None, wb.astype(act.dtype),
+                               *([] if keep is None else [keep.reshape(-1)]))
+    return bias.reshape(-1, x, y)
+
+  @hk.transparent
+  def _slab_attention(self, act, bias, kmask, kernels, residual, keep, chunk_size, params):
+    """_ln_projection and _ln_packed_attention a slab of the attention's batch at a time (rows, or columns when
+    transposed), so the [X, Y, 4, H, D] projection is never whole; the bias spans the pair and comes in whole.
+    Parameters are fetched once out here: each hk.name_scope a slab entered would get a fresh name."""
+    out_params = self._output_params(act, *params[2].shape[-2:])
+
+    def slab(a, m, r, k):
+      p, _, kv, gb = self._ln_projection(a, kernels[1], k, params, act.shape[0 if self.transpose else 1])
+      return self._ln_packed_attention(a, p, bias, kv, gb, m, kernels, r, k, out_params)
+
+    # kmask is [batch, keys] in either direction
+    ax = 1 if self.transpose else 0
+    return mapping.sharded_apply(slab, chunk_size, in_axes=(ax, 0, ax, ax), out_axes=ax)(act, kmask, residual, keep)
 
   def __call__(self, act, pair_mask, residual=None, keep_mask=None):
     """Builds a module.
@@ -465,11 +505,18 @@ class GridSelfAttention(hk.Module):
         num_residues, self.global_config.pair_attention_chunk_size
     )
     # dual_output mixes both directions: stock path
-    packed = PACKED_ATTENTION is not None and chunk_size is None and not self.config.dual_output
+    packed = PACKED_ATTENTION is not None and not self.config.dual_output
     kernels = self._ln_projection_kernels(act) if packed else None
-    if kernels is not None:
+    # past the chunking length only the fused path stays packed: whole, or a slab of rows (columns) at a time once
+    # the projection outgrows PACKED_SLAB_BYTES (parameters fetched once: a repeated hk.name_scope gets a fresh name)
+    packed = packed and (chunk_size is None or kernels is not None)
+    fused = self._projection_params(act) if kernels is not None and chunk_size is not None else None
+    slabs = fused is not None and act.shape[0] * act.shape[1] * fused[2][0].size * act.dtype.itemsize > PACKED_SLAB_BYTES
+    if slabs:
+      nonbatched_bias = self._pair_bias(act, kernels[1], fused, keep)
+    elif kernels is not None:
       # act_norm and pair_bias_projection run in the kernel that projects q/k/v/gate; the bias comes out as below
-      p, nonbatched_bias, kv, gate_bias = self._ln_projection(act, kernels[1], keep)
+      p, nonbatched_bias, kv, gate_bias = self._ln_projection(act, kernels[1], keep, fused)
     else:
       act = hm.LayerNorm(name='act_norm')(act)
 
@@ -541,7 +588,9 @@ class GridSelfAttention(hk.Module):
       # model_config.BF16_TRI_ATT_PAIR_BIAS)
       nonbatched_bias = nonbatched_bias.astype(jnp.bfloat16).astype(nonbatched_bias.dtype)
 
-    if kernels is not None:
+    if slabs:
+      out = self._slab_attention(act, nonbatched_bias, pair_mask, kernels, residual, keep, chunk_size, fused)
+    elif kernels is not None:
       out = self._ln_packed_attention(act, p, nonbatched_bias, kv, gate_bias, pair_mask, kernels, residual, keep)
     elif packed:
       out = self._packed_attention(act, nonbatched_bias, pair_mask)
@@ -581,6 +630,9 @@ class GridSelfAttention(hk.Module):
 
 # the f32 gated projection size above which the triangle multiplication runs by channel blocks
 TRIMUL_BLOCK_BYTES = 8 * 2 ** 30
+# the packed [X, Y, 4, H, D] projection size above which triangle attention runs it a slab of rows at a time, once the
+# config chunks it; below, the whole projection is cheaper than the slabs' slice and update copies (+7-15% at 2,560)
+PACKED_SLAB_BYTES = 8 * 2 ** 30
 
 
 def _real_length(pair_mask, num_residues):
