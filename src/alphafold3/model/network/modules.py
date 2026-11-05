@@ -37,8 +37,9 @@ import tokamax
 # PACKED_ATTENTION(dtype, head_dim) -> f(p, bias, kmask, gate_bias[, kv], *, sm_scale, column) or None
 PACKED_ATTENTION = None
 # PAIR_PROJECTIONS(dtype, channels, num_head, head_dim) -> (ln_projection, output_projection) or None, around it:
-# ln_projection(x, ln_scale, ln_offset, w, wb[, keep], seq_len=None) -> (p, bias [h, M], kv or None), w None for the bias
-# alone, seq_len the attended length when x is a slab, not the whole pair; output_projection(o, w, b[, residual])
+# ln_projection(x, ln_scale, ln_offset, w, wb[, keep], seq_len=None, rows=None) -> (p, bias [h, M], kv or None), w None
+# for the bias alone, seq_len the attended length when x is a slab, rows (start, slab) to read a slab's rows of the whole
+# x in place (colabfold_kernels packed_attn.slab_index); output_projection(o, w, b[, residual, keep, start], slab=None)
 PAIR_PROJECTIONS = None
 # TRIMUL_KERNELS(dtype, channels, hidden) -> (contract, epilogue) or None, both reading the raw input and its LN params:
 # contract(x, ln_scale, ln_offset, wp, bp, wg, bg, mask, *, equation) -> [hidden, N, N]; epilogue is trimul_epilogue_ln
@@ -429,20 +430,25 @@ class GridSelfAttention(hk.Module):
     return wo, jnp.zeros((act.shape[-1],), act.dtype) if bo is None else bo.astype(act.dtype)
 
   @hk.transparent
-  def _ln_projection(self, act, ln_projection, keep=None, params=None, seq_len=None):
-    """act_norm, q/k/v/gate and the pair bias in one kernel from the raw pair: p [X, Y, G, H, D], bias [H, X, Y]."""
-    x, y, c = act.shape
+  def _ln_projection(self, act, ln_projection, keep=None, params=None, seq_len=None, rows=None):
+    """act_norm, q/k/v/gate and the pair bias in one kernel from the raw pair: p [X, Y, G, H, D], bias [H, X, Y].
+    rows (start, slab, (X, Y)): only the slab's X x Y pairs of the whole act, read in place (see _slab_attention)."""
+    x, y, c = act.shape if rows is None else (*rows[2], act.shape[-1])
     h = self.config.num_head
     d = self.config.qkv_dim or max(c // h, 16)
     ln, wb, w, gb = params or self._projection_params(act)
+    kw = {} if seq_len is None else {'seq_len': seq_len}
+    if rows is not None:
+      kw['rows'] = rows[:2]
     p, bias, kv = ln_projection(act.reshape(-1, c), *ln, jnp.moveaxis(w, 1, 0).reshape(4, c, h * d),
-                                wb.astype(act.dtype), *([] if keep is None else [keep.reshape(-1)]),
-                                **({} if seq_len is None else {'seq_len': seq_len}))
+                                None if wb is None else wb.astype(act.dtype),
+                                *([] if keep is None else [keep.reshape(-1)]), **kw)
     kv = None if kv is None else kv.reshape(x, y, 2, h, d)
-    return p.reshape(x, y, -1, h, d), bias.reshape(h, x, y), kv, gb
+    return p.reshape(x, y, -1, h, d), None if bias is None else bias.reshape(h, x, y), kv, gb
 
   @hk.transparent
-  def _ln_packed_attention(self, act, p, bias, kv, gb, kmask, kernels, residual, keep=None, out_params=None):
+  def _ln_packed_attention(self, act, p, bias, kv, gb, kmask, kernels, residual, keep=None, out_params=None,
+                           rows=None):
     """The packed kernel on _ln_projection's output, then output_projection with the residual in one kernel."""
     attention, _, output_projection = kernels
     x, y, c = act.shape
@@ -453,7 +459,11 @@ class GridSelfAttention(hk.Module):
     res = [] if residual is None else [residual.reshape(-1, c)]
     if keep is not None:
       res = (res or [None]) + [keep.reshape(-1)]
-    return output_projection(out.reshape(-1, h * d), wo.astype(act.dtype), bo, *res).reshape(x, y, c)
+    kw = {}
+    if rows is not None:
+      # the slab's rows of the whole residual, updated in place: the result is the whole pair
+      res, kw = res + [None] * (2 - len(res)) + [rows[0]], {'slab': rows[1]}
+    return output_projection(out.reshape(-1, h * d), wo.astype(act.dtype), bo, *res, **kw).reshape(x, y, c)
 
   @hk.transparent
   def _pair_bias(self, act, ln_projection, params, keep=None):
@@ -471,13 +481,32 @@ class GridSelfAttention(hk.Module):
     transposed), so the [X, Y, 4, H, D] projection is never whole; the bias spans the pair and comes in whole.
     Parameters are fetched once out here: each hk.name_scope a slab entered would get a fresh name."""
     out_params = self._output_params(act, *params[2].shape[-2:])
-
-    def slab(a, m, r, k):
-      p, _, kv, gb = self._ln_projection(a, kernels[1], k, params, act.shape[0 if self.transpose else 1])
-      return self._ln_packed_attention(a, p, bias, kv, gb, m, kernels, r, k, out_params)
-
     # kmask is [batch, keys] in either direction
     ax = 1 if self.transpose else 0
+    seq_len = act.shape[1 - ax]
+    if residual is act:
+      # the residual is the pair: a slab reads its own rows (columns) of it, which no other slab reads, and adds into
+      # them in place, so the loop carries the one pair and copies nothing
+      ln, _, w, gb = params
+      X, Y, _ = act.shape
+
+      def run(buf, j0, n):
+        x, y = (X, n) if self.transpose else (n, Y)
+        start = jnp.reshape(j0 if self.transpose else j0 * Y, (1,)).astype(jnp.int32)
+        rows = (start, (x * y, n, Y) if self.transpose else (x * y,) * 3, (x, y))
+        k = None if keep is None else jax.lax.dynamic_slice_in_dim(keep, j0, n, ax)
+        m = jax.lax.dynamic_slice_in_dim(kmask, j0, n, 0)
+        p, _, kv, g = self._ln_projection(buf, kernels[1], k, (ln, None, w, gb), seq_len, rows)
+        return self._ln_packed_attention(buf, p, bias, kv, g, m, kernels, buf, k, out_params, rows)
+
+      whole, rest = divmod(act.shape[ax], chunk_size)
+      buf = hk.fori_loop(0, whole, lambda i, b: run(b, i * chunk_size, chunk_size), act)
+      return buf if not rest else run(buf, whole * chunk_size, rest)
+
+    def slab(a, m, r, k):
+      p, _, kv, gb = self._ln_projection(a, kernels[1], k, params, seq_len)
+      return self._ln_packed_attention(a, p, bias, kv, gb, m, kernels, r, k, out_params)
+
     return mapping.sharded_apply(slab, chunk_size, in_axes=(ax, 0, ax, ax), out_axes=ax)(act, kmask, residual, keep)
 
   def __call__(self, act, pair_mask, residual=None, keep_mask=None):
@@ -589,7 +618,10 @@ class GridSelfAttention(hk.Module):
       nonbatched_bias = nonbatched_bias.astype(jnp.bfloat16).astype(nonbatched_bias.dtype)
 
     if slabs:
-      out = self._slab_attention(act, nonbatched_bias, pair_mask, kernels, residual, keep, chunk_size, fused)
+      # slabs of PACKED_SLAB_PART_BYTES of projection: few launches, each long enough that its tail does not show
+      row = act.shape[0 if self.transpose else 1] * fused[2][0].size * act.dtype.itemsize
+      rows = max(chunk_size, PACKED_SLAB_PART_BYTES // row // 64 * 64)
+      out = self._slab_attention(act, nonbatched_bias, pair_mask, kernels, residual, keep, rows, fused)
     elif kernels is not None:
       out = self._ln_packed_attention(act, p, nonbatched_bias, kv, gate_bias, pair_mask, kernels, residual, keep)
     elif packed:
@@ -633,6 +665,8 @@ TRIMUL_BLOCK_BYTES = 8 * 2 ** 30
 # the packed [X, Y, 4, H, D] projection size above which triangle attention runs it a slab of rows at a time, once the
 # config chunks it; below, the whole projection is cheaper than the slabs' slice and update copies (+7-15% at 2,560)
 PACKED_SLAB_BYTES = 8 * 2 ** 30
+# a slab's share of it: 256-row slabs cost the attention kernel 3% in launch tails at 2,560 tokens
+PACKED_SLAB_PART_BYTES = 2 * 2 ** 30
 
 
 def _real_length(pair_mask, num_residues):
