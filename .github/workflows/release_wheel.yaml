@@ -20,7 +20,7 @@ jobs:
             runs_on: ubuntu-24.04-arm
             build: "cp312-manylinux_aarch64 cp313-manylinux_aarch64 cp314-manylinux_aarch64"
           - name: macos-arm64
-            runs_on: macos-14
+            runs_on: macos-latest
             build: "cp312-macosx_arm64 cp313-macosx_arm64 cp314-macosx_arm64"
 
     steps:
