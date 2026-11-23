@@ -611,6 +611,29 @@ def _chai_unpaired_order(chain):
   return [i - first_single for i in order if i >= first_single]
 
 
+def _chain_asym_ids(batch):
+  """-> {chain id: asym_id group} over the batch's real tokens, or None without a token-atom layout.
+
+  The featuriser numbers the cleaned structure's chains in their own order, assigning each chain's group
+  by its id (features.py _compute_asym_entity_and_sym_id), and structure cleaning may have reordered
+  (with_sorted_chains, the AF3 default) or dropped the chains relative to fold_input.chains -- so a
+  chain's group in the batch is keyed by its id, not by its position in fold_input.chains. A chain the
+  cleaning dropped maps to nothing. The same positional assumption (chain i is asym i + 1) is still made
+  by _boltz_msa, _rf3_msa, _of3_msa_rows and the modification mappings here, unfixed.
+  """
+  lay = batch.get('token_atoms_layout')
+  if lay is None:
+    return None
+  lay = lay.item() if getattr(lay, 'ndim', None) == 0 else lay
+  asym = np.asarray(batch['asym_id']).reshape(-1)
+  chain = np.asarray(lay.chain_id)[:, 0].astype(str)   # a token's chain id fills its row; padding rows are ''
+  ids = {}
+  for t in np.flatnonzero(chain):
+    if asym[t]:
+      ids.setdefault(chain[t], int(asym[t]))
+  return ids
+
+
 def _chai_msa(batch, fold_input):
   """chai-1's MSA inputs where AF3's differ, once any chain has an alignment.
 
@@ -641,8 +664,13 @@ def _chai_msa(batch, fold_input):
   vocab = list(residue_names.POLYMER_TYPES_WITH_UNKNOWN_AND_GAP)
   to_cls = {c: vocab.index(residue_names.PROTEIN_COMMON_ONE_TO_THREE.get(c, residue_names.UNK)) for c in string.ascii_uppercase}
   to_cls['-'] = vocab.index(residue_names.GAP)
+  asym_of = _chain_asym_ids(batch)
   for index, chain in enumerate(fold_input.chains):
-    sel = np.flatnonzero(asym == index + 1)
+    # the batch's asym groups follow the CLEANED structure's chain order, which with_sorted_chains may have
+    # rearranged against fold_input's: resolve the group by the chain's id (unique, kept by the cleaning),
+    # falling back to the input position only where no layout says otherwise
+    group = asym_of.get(str(chain.id)) if asym_of is not None else index + 1
+    sel = np.flatnonzero(asym == group) if group is not None else np.array([], int)
     if isinstance(chain, fi.Ligand) or not sel.size:
       continue
     col = resi[sel] - 1
@@ -705,7 +733,8 @@ def _chai_msa(batch, fold_input):
   n_rows = int(np.asarray(batch.get('num_alignments', msa.shape[0])))
   per_chain = []
   for index, chain in enumerate(fold_input.chains):
-    sel = np.flatnonzero(asym == index + 1)
+    group = asym_of.get(str(chain.id)) if asym_of is not None else index + 1
+    sel = np.flatnonzero(asym == group) if group is not None else np.array([], int)
     if isinstance(chain, fi.ProteinChain) and sel.size and mask[n_paired:n_rows][:, sel].any():
       per_chain.append((sel, chain))
   if len(per_chain) > 1:
