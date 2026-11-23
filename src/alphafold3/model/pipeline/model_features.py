@@ -2841,9 +2841,15 @@ def cyclic_period(batch, chains=True, fold_input=None):
   else:
     if fold_input is None:
       raise ValueError('naming cyclic chains by id needs fold_input=')
-    # asym_id is 1-based and assigned in chain order.
-    by_id = {chain.id: index + 1
-             for index, chain in enumerate(fold_input.chains)}
+    # the batch's asym groups follow the CLEANED structure's chain order (_chain_asym_ids), which
+    # with_sorted_chains may have rearranged against fold_input's, so a chain's group is its id's, not
+    # its input position's
+    asym_of = _chain_asym_ids(batch)
+    by_id = {}
+    for index, chain in enumerate(fold_input.chains):
+      grp = (asym_of.get(str(chain.id)) if asym_of is not None else index + 1)
+      if grp is not None:
+        by_id[chain.id] = grp
     unknown = set(chains) - set(by_id)
     if unknown:
       raise ValueError(f'no chain(s) {sorted(unknown)} in this input; it has '

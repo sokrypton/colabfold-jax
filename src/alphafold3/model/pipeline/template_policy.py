@@ -159,9 +159,17 @@ def unknown_restype_templates(batch, fold_input):
   asym = np.asarray(batch['asym_id']).reshape(-1)
   resi = np.asarray(batch['residue_index']).reshape(-1)
   atom37 = [atom_types.ATOM37_ORDER[n] for n in ('N', 'CA', 'C', 'CB')]
+  # the batch's asym groups follow the CLEANED structure's chain order, which with_sorted_chains may
+  # have rearranged against fold_input's: resolve each chain's group by its id, as stock keys its
+  # MSA/template inputs (unpaired_msa_by_chain_id...), not by its input position
+  from alphafold3.model.pipeline.model_features import _chain_asym_ids
+  asym_of = _chain_asym_ids(batch)
   for ci, chain in enumerate(fold_input.chains):
     if not isinstance(chain, fi.ProteinChain) or not chain.templates:
       continue
+    grp = (asym_of.get(str(chain.id)) if asym_of is not None else ci + 1)
+    if grp is None:
+      continue                  # the cleaning dropped this chain
     for k, t in enumerate(chain.templates[:aatype.shape[0]]):
       struc = structure.from_mmcif(t.mmcif, fix_mse_residues=False, fix_arginines=False, include_bonds=False,
                                    include_water=False, include_other=True).filter_to_entity_type(protein=True)
@@ -170,7 +178,7 @@ def unknown_restype_templates(batch, fold_input):
       for q, j in t.query_to_template_map.items():
         if j >= len(names) or names[j] in _STANDARD_AA:
           continue
-        tok = np.nonzero((asym == ci + 1) & (resi == q + 1))[0]
+        tok = np.nonzero((asym == grp) & (resi == q + 1))[0]
         have = arrays.atom_mask[j][atom37] > 0
         pos[k, tok] = 0
         mask[k, tok] = 0
