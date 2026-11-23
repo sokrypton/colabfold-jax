@@ -618,8 +618,7 @@ def _chain_asym_ids(batch):
   by its id (features.py _compute_asym_entity_and_sym_id), and structure cleaning may have reordered
   (with_sorted_chains, the AF3 default) or dropped the chains relative to fold_input.chains -- so a
   chain's group in the batch is keyed by its id, not by its position in fold_input.chains. A chain the
-  cleaning dropped maps to nothing. The same positional assumption (chain i is asym i + 1) is still made
-  by _boltz_msa, _rf3_msa, _of3_msa_rows and the modification mappings here, unfixed.
+  cleaning dropped maps to nothing.
   """
   lay = batch.get('token_atoms_layout')
   if lay is None:
@@ -1086,7 +1085,15 @@ def _boltz_msa(batch, fold_input, variant='boltz2'):
   if not if2:
     query[lig & real] = unk
   max_seqs = _IF2_MAX_MSA_SEQS if if2 else _BOLTZ_MAX_MSA_SEQS
-  chains = [i for i in range(len(fold_input.chains)) if (real & (asym == i + 1)).any()]
+  # the batch's asym groups follow the CLEANED structure's chain order, which with_sorted_chains may
+  # have rearranged against fold_input's: resolve each chain's group by its id (_chain_asym_ids)
+  asym_of = _chain_asym_ids(batch)
+
+  def _chain_group(i):
+    c = fold_input.chains[i]
+    return (asym_of.get(str(c.id)) if asym_of is not None else i + 1)
+  chains = [i for i in range(len(fold_input.chains))
+            if _chain_group(i) is not None and (real & (asym == _chain_group(i))).any()]
   seqs = {}
   for i in chains:
     c = fold_input.chains[i]
@@ -1149,7 +1156,7 @@ def _boltz_msa(batch, fold_input, variant='boltz2'):
   flag = np.zeros((n_row, n_tok), np.float32)
   msa[0] = query
   for i in chains:
-    sel = np.flatnonzero(real & (asym == i + 1))
+    sel = np.flatnonzero(real & (asym == _chain_group(i)))
     flag[:, sel] = np.asarray([p[i] for p in is_paired], np.float32)[:, None]
     if i not in seqs:
       continue
@@ -1169,7 +1176,7 @@ def _boltz_msa(batch, fold_input, variant='boltz2'):
     profile = np.zeros((n_tok, n_cls), np.float32)
     del_mean = np.zeros(n_tok, np.float32)
     for i in chains:
-      sel = np.flatnonzero(real & (asym == i + 1))
+      sel = np.flatnonzero(real & (asym == _chain_group(i)))
       depth = len(seqs.get(i, [None]))      # msa_valid_depths: the chain's own sequence count, not its rows
       sub = np.minimum(msa[:depth][:, sel], n_cls - 1)
       profile[sel] = (np.arange(n_cls) == sub[..., None]).mean(0)
@@ -1339,8 +1346,12 @@ def _rf3_msa(batch, fold_input):
       a = np.flatnonzero(amask[t])
       if not a.size or str(layout.res_name[t, a[0]]) not in standard:
         msa[0, t] = unk
+  asym_of = _chain_asym_ids(batch)
   for i, key in chain_entity.items():
-    sel = np.flatnonzero(real & (asym == i + 1) & ~atomised)
+    grp = (asym_of.get(str(fold_input.chains[i].id)) if asym_of is not None else i + 1)
+    if grp is None:
+      continue                  # the cleaning dropped this chain
+    sel = np.flatnonzero(real & (asym == grp) & ~atomised)
     col = resi[sel] - 1
     for r, (tok, d, pad, pair) in enumerate(entity_rows[key], start=1):
       if tok.size > col.max():
@@ -2417,6 +2428,7 @@ def _modified_restype_protein_unknown(batch, fold_input, nucleic_unknown=False):
   asym = np.asarray(batch['asym_id']).reshape(-1)
   resi = np.asarray(batch['residue_index']).reshape(-1)
   aatype = np.array(batch['aatype'])
+  asym_of = _chain_asym_ids(batch)
   for index, chain in enumerate(fold_input.chains):
     mods = (getattr(chain, 'ptms', None)
             or getattr(chain, 'modifications', None) or ())
@@ -2424,8 +2436,11 @@ def _modified_restype_protein_unknown(batch, fold_input, nucleic_unknown=False):
     # token then carries as HelixFold3's DN (model.hf3_dn_columns)
     from alphafold3.common import folding_input as fi
     nucleic = nucleic_unknown and not isinstance(chain, fi.ProteinChain)
+    grp = asym_of.get(str(chain.id)) if asym_of is not None else index + 1
+    if grp is None:
+      continue                  # the cleaning dropped this chain
     for _code, residue in mods:
-      aatype[(asym == index + 1) & (resi == int(residue))] = 30 if nucleic else 20   # protein UNK
+      aatype[(asym == grp) & (resi == int(residue))] = 30 if nucleic else 20   # protein UNK
   batch['aatype'] = aatype
   return batch
 
@@ -2509,7 +2524,9 @@ def _of3_paired_query_row(batch, fold_input):
   from alphafold3.constants import residue_names
   gap = list(residue_names.POLYMER_TYPES_WITH_UNKNOWN_AND_GAP).index(residue_names.GAP)
   asym = np.asarray(batch['asym_id']).reshape(-1)
-  paired = [i + 1 for i, c in enumerate(fold_input.chains) if _has_alignment(getattr(c, 'paired_msa', None))]
+  asym_of = _chain_asym_ids(batch)
+  paired = [grp for i, c in enumerate(fold_input.chains) if _has_alignment(getattr(c, 'paired_msa', None))
+            and (grp := (asym_of.get(str(c.id)) if asym_of is not None else i + 1)) is not None]
   unpaired_tok = ~np.isin(asym, paired)
   for k in ('msa', 'msa_mask', 'deletion_matrix'):
     if k not in batch:
@@ -2542,14 +2559,18 @@ def _modified_restype_protein_letter(batch, fold_input):
   aatype = np.array(batch['aatype'])
   msa = np.array(batch['msa']) if 'msa' in batch else None
   changed = False
+  asym_of = _chain_asym_ids(batch)
   for index, chain in enumerate(fold_input.chains):
     mods = (getattr(chain, 'ptms', None)
             or getattr(chain, 'modifications', None) or ())
+    grp = (asym_of.get(str(chain.id)) if asym_of is not None else index + 1)
+    if grp is None:
+      continue                  # the cleaning dropped this chain
     for code, residue in mods:
       entry = ccd.get(code) or {}
       one = (entry.get('_chem_comp.one_letter_code') or ['X'])[0].upper()
       restype = letters.index(one) if one in letters else 20   # protein UNK
-      toks = np.flatnonzero((asym == index + 1) & (resi == int(residue)))
+      toks = np.flatnonzero((asym == grp) & (resi == int(residue)))
       aatype[toks] = restype
       if msa is not None:
         msa[0, toks] = restype
@@ -2575,12 +2596,16 @@ def _modified_self_bonds(batch, fold_input):
   """
   from alphafold3.constants import decoded_ccd
   ccd = decoded_ccd.get_ccd()
+  asym_of = _chain_asym_ids(batch)
   code_of = {}
   for index, chain in enumerate(fold_input.chains):
+    grp = (asym_of.get(str(chain.id)) if asym_of is not None else index + 1)
+    if grp is None:
+      continue                  # the cleaning dropped this chain
     mods = (getattr(chain, 'ptms', None)
             or getattr(chain, 'modifications', None) or ())
     for code, residue in mods:
-      code_of[(index + 1, int(residue))] = code
+      code_of[(grp, int(residue))] = code
   residue_index = np.asarray(batch['residue_index'])
   asym_id = np.asarray(batch['asym_id'])
   chars = np.asarray(batch['ref_atom_name_chars'])
@@ -2637,6 +2662,7 @@ def _boltz_smiles_atom_names(batch, fold_input):
   asym_id = np.asarray(batch['asym_id'])
   chars = np.array(batch['ref_atom_name_chars'])
   mask = np.asarray(batch['ref_mask']).astype(bool)
+  asym_of = _chain_asym_ids(batch)
   for index, chain in enumerate(fold_input.chains):
     smiles = getattr(chain, 'smiles', None)
     if not smiles:
@@ -2645,7 +2671,8 @@ def _boltz_smiles_atom_names(batch, fold_input):
     rank = list(AllChem.CanonicalRankAtoms(mol))
     names = [a.GetSymbol().upper() + str(rank[a.GetIdx()] + 1)
              for a in mol.GetAtoms() if a.GetAtomicNum() > 1]
-    tokens = np.flatnonzero(asym_id == index + 1)
+    grp = (asym_of.get(str(chain.id)) if asym_of is not None else index + 1)
+    tokens = np.flatnonzero(asym_id == grp) if grp is not None else np.array([], int)
     if len(tokens) != len(names):
       continue      # not one token per heavy atom; leave AF3's names alone
     for t, nm in zip(tokens, names):
@@ -2690,17 +2717,22 @@ def _smiles_bond_orders(batch, tokens, mol):
   batch['ligand_ligand_bond_order'] = orders
 
 
-def _modified_residue_positions(fold_input):
+def _modified_residue_positions(fold_input, asym_of=None):
   """-> {(asym_id, 1-based residue index)} of every modified polymer residue.
 
-  asym_id is 1-based and assigned in chain order, so chain i is asym_id i + 1.
+  The batch's asym groups follow the CLEANED structure's chain order (_chain_asym_ids), which
+  with_sorted_chains may have rearranged against fold_input's, so a chain's group is its id's, not
+  its input position's.
   """
   positions = set()
   for index, chain in enumerate(fold_input.chains):
+    grp = (asym_of.get(str(chain.id)) if asym_of is not None else index + 1)
+    if grp is None:
+      continue                  # the cleaning dropped this chain
     mods = (getattr(chain, 'ptms', None)
             or getattr(chain, 'modifications', None) or ())
     for _code, residue in mods:
-      positions.add((index + 1, int(residue)))
+      positions.add((grp, int(residue)))
   return positions
 
 
@@ -2722,7 +2754,7 @@ def _mark_modified_residues(batch, fold_input, unknown_restype=False):
   """
   from alphafold3.constants import residue_names
 
-  wanted = _modified_residue_positions(fold_input)
+  wanted = _modified_residue_positions(fold_input, _chain_asym_ids(batch))
   residue_index = np.asarray(batch['residue_index'])
   asym_id = np.asarray(batch['asym_id'])
   flag = np.zeros(residue_index.shape, np.int32)
