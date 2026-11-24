@@ -1170,8 +1170,8 @@ def _resolve_esm(use_esm, fold_input, model_runner):
 
   if model_name == 'chai1':
     print('Running the ESM2 tower for chai-1...')
-    # Multi-chain is fine here: the rows are concatenated in chain order and
-    # land on the batch's protein tokens in that order.
+    # Rows follow input-chain order; model_features maps them to cleaned batch
+    # tokens by chain ID and residue index.
     # chai-lab hands ESM2 its entity sequence 'with modified residues encoded as
     # X' (all_atom_entity_data.py), so a modified position reads X here too.
     sequences = [
@@ -1264,6 +1264,7 @@ def predict_structure(
             model_dir=model_runner.model_dir,
             esm=esm_embeddings,
             lm_pair=lm_pair_array,
+            lm_pair_input_order=True,
             has_msa=has_msa,
             fold_input=fold_input,
             cyclic=cyclic,
