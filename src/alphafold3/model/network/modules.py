@@ -652,8 +652,8 @@ class GridSelfAttention(hk.Module):
       nonbatched_bias = jnp.swapaxes(nonbatched_bias, -1, -2)
     if self.global_config.model in model_config.BF16_TRI_ATT_PAIR_BIAS:
       # helixfold3 adds the pair bias as bfloat16 even in float32 (see
-      # model_config.BF16_TRI_ATT_PAIR_BIAS)
-      nonbatched_bias = nonbatched_bias.astype(jnp.bfloat16).astype(nonbatched_bias.dtype)
+      # model_config.BF16_TRI_ATT_PAIR_BIAS); reduce_precision, as XLA drops a cast round trip
+      nonbatched_bias = jax.lax.reduce_precision(nonbatched_bias, 8, 7)
 
     if slabs:
       # slabs of PACKED_SLAB_PART_BYTES of projection: few launches, each long enough that its tail does not show
