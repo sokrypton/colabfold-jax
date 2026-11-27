@@ -33,6 +33,7 @@ pipeline (the genetic databases in
 | File | Job name | What it demonstrates |
 |---|---|---|
 | [`regression/5kx0_cyclic_dl_peptide.json`](regression/5kx0_cyclic_dl_peptide.json) | `5kx0` | A de novo cyclic peptide (PDB 5KX0) with eleven D-amino acids given as modifications (`DAS`, `DPR`, `DGL`, ...) and an intra-chain disulfide (Cys8 to D-Cys21) in `bondedAtomPairs`. Its MSA and templates are set empty, so it runs without the data pipeline. It is the target where a model's learned L-prior is wrong eleven times; `scripts/dl_chirality_score.py` scores the result (see [docs/ported_models.md](../docs/ported_models.md)). |
+| [`regression/hemoglobin_alternating_chain_ids.json`](regression/hemoglobin_alternating_chain_ids.json) | `hemoglobin_alternating_chain_ids` | A protein-only hemoglobin heterotetramer with alpha IDs `A,C` and beta IDs `B,D`. Embedded synthetic paired/unpaired MSAs and grouped IDs expose incorrect MSA and ESM feature mapping after cleaning sorts the chains. |
 
 ## Checking and running an example
 
@@ -59,7 +60,7 @@ python run_alphafold.py \
   --norun_data_pipeline
 ```
 
-The regression input needs no MSA at all. `--cyclic=A` wraps chain A's
+The cyclic-peptide regression input needs no MSA at all. `--cyclic=A` wraps chain A's
 relative-position encoding (see the README's "Cyclic chains"):
 
 ```sh

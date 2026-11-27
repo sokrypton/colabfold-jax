@@ -611,6 +611,26 @@ def _chai_unpaired_order(chain):
   return [i - first_single for i in order if i >= first_single]
 
 
+def _chain_asym_ids(batch, fold_input):
+  """Map input chain IDs to batch asym IDs, omitting chains removed by cleaning.
+
+  Cleaning can reorder or drop chains. Token layouts retain their IDs, so use
+  those rather than input positions. Legacy batches without a layout use
+  input positions, which assumes their token chains still follow input order.
+  """
+  lay = batch.get('token_atoms_layout')
+  lay = lay.item() if getattr(lay, 'ndim', None) == 0 else lay
+  if lay is None:
+    return {str(chain.id): i + 1 for i, chain in enumerate(fold_input.chains)}
+  asym = np.asarray(batch['asym_id']).reshape(-1)
+  chain = np.asarray(lay.chain_id)[:, 0].astype(str)   # a token's chain id fills its row; padding rows are ''
+  ids = {}
+  for t in np.flatnonzero(chain):
+    if asym[t]:
+      ids.setdefault(chain[t], int(asym[t]))
+  return ids
+
+
 def _chai_msa(batch, fold_input):
   """chai-1's MSA inputs where AF3's differ, once any chain has an alignment.
 
@@ -641,8 +661,10 @@ def _chai_msa(batch, fold_input):
   vocab = list(residue_names.POLYMER_TYPES_WITH_UNKNOWN_AND_GAP)
   to_cls = {c: vocab.index(residue_names.PROTEIN_COMMON_ONE_TO_THREE.get(c, residue_names.UNK)) for c in string.ascii_uppercase}
   to_cls['-'] = vocab.index(residue_names.GAP)
-  for index, chain in enumerate(fold_input.chains):
-    sel = np.flatnonzero(asym == index + 1)
+  asym_of = _chain_asym_ids(batch, fold_input)
+  for chain in fold_input.chains:
+    group = asym_of.get(str(chain.id))
+    sel = np.flatnonzero(asym == group) if group is not None else np.array([], int)
     if isinstance(chain, fi.Ligand) or not sel.size:
       continue
     col = resi[sel] - 1
@@ -704,8 +726,9 @@ def _chai_msa(batch, fold_input):
   n_paired = int(np.asarray(batch.get('num_paired_alignments', 1)))
   n_rows = int(np.asarray(batch.get('num_alignments', msa.shape[0])))
   per_chain = []
-  for index, chain in enumerate(fold_input.chains):
-    sel = np.flatnonzero(asym == index + 1)
+  for chain in fold_input.chains:
+    group = asym_of.get(str(chain.id))
+    sel = np.flatnonzero(asym == group) if group is not None else np.array([], int)
     if isinstance(chain, fi.ProteinChain) and sel.size and mask[n_paired:n_rows][:, sel].any():
       per_chain.append((sel, chain))
   if len(per_chain) > 1:
@@ -1057,7 +1080,11 @@ def _boltz_msa(batch, fold_input, variant='boltz2'):
   if not if2:
     query[lig & real] = unk
   max_seqs = _IF2_MAX_MSA_SEQS if if2 else _BOLTZ_MAX_MSA_SEQS
-  chains = [i for i in range(len(fold_input.chains)) if (real & (asym == i + 1)).any()]
+  asym_of = _chain_asym_ids(batch, fold_input)
+
+  groups = {i: asym_of[str(c.id)] for i, c in enumerate(fold_input.chains)
+            if str(c.id) in asym_of}
+  chains = [i for i, group in groups.items() if (real & (asym == group)).any()]
   seqs = {}
   for i in chains:
     c = fold_input.chains[i]
@@ -1120,7 +1147,7 @@ def _boltz_msa(batch, fold_input, variant='boltz2'):
   flag = np.zeros((n_row, n_tok), np.float32)
   msa[0] = query
   for i in chains:
-    sel = np.flatnonzero(real & (asym == i + 1))
+    sel = np.flatnonzero(real & (asym == groups[i]))
     flag[:, sel] = np.asarray([p[i] for p in is_paired], np.float32)[:, None]
     if i not in seqs:
       continue
@@ -1140,7 +1167,7 @@ def _boltz_msa(batch, fold_input, variant='boltz2'):
     profile = np.zeros((n_tok, n_cls), np.float32)
     del_mean = np.zeros(n_tok, np.float32)
     for i in chains:
-      sel = np.flatnonzero(real & (asym == i + 1))
+      sel = np.flatnonzero(real & (asym == groups[i]))
       depth = len(seqs.get(i, [None]))      # msa_valid_depths: the chain's own sequence count, not its rows
       sub = np.minimum(msa[:depth][:, sel], n_cls - 1)
       profile[sel] = (np.arange(n_cls) == sub[..., None]).mean(0)
@@ -1310,8 +1337,12 @@ def _rf3_msa(batch, fold_input):
       a = np.flatnonzero(amask[t])
       if not a.size or str(layout.res_name[t, a[0]]) not in standard:
         msa[0, t] = unk
+  asym_of = _chain_asym_ids(batch, fold_input)
   for i, key in chain_entity.items():
-    sel = np.flatnonzero(real & (asym == i + 1) & ~atomised)
+    grp = asym_of.get(str(fold_input.chains[i].id))
+    if grp is None:
+      continue                  # the cleaning dropped this chain
+    sel = np.flatnonzero(real & (asym == grp) & ~atomised)
     col = resi[sel] - 1
     for r, (tok, d, pad, pair) in enumerate(entity_rows[key], start=1):
       if tok.size > col.max():
@@ -1576,42 +1607,64 @@ def _native_nonprotein_msa(batch, unk=20, gap=21):
   return batch
 
 
-def _attach_esm(batch, esm):
-  """Put ESM2 embeddings on the protein tokens, in order; everything else zero.
+def _protein_lm_indices(batch, fold_input=None):
+  """Return protein token indices, their source LM rows, and source row count.
 
-  chai-1's TOKEN feature stream is mostly ESM2 -- zeroing it drops the token
-  embedding to corr 0.327 of chai's, and a natural protein folds to 5.70 A where
-  chai reaches 0.642. `esm` is (num_protein_tokens, 2560) in token order, chai's
-  own traced ESM whose raw last hidden state IS the feature verbatim.
+  Towers concatenate one row per protein residue in input-chain order. Cleaning
+  can reorder or remove chains, and atomisation repeats a residue across tokens.
+  Resolve both by chain ID and 1-based residue index. Without fold_input, retain
+  the legacy contract: LM residues already follow the batch's chain order.
   """
-  is_protein = np.asarray(batch['is_protein']).astype(bool)
-  out = np.zeros(is_protein.shape + (np.asarray(esm).shape[-1],), np.float32)
-  idxs = np.flatnonzero(is_protein)
-  rows = np.asarray(esm, np.float32)
-  # ONE ROW PER RESIDUE, NOT PER TOKEN -- the same fix `_attach_lm_pair` needed,
-  # and found the same way. A language model reads a SEQUENCE, so its rows are
-  # residues; AF3 ATOMISES a modified residue into one token per atom, all of
-  # them protein. Keying on the protein-token count raised `esm has 76 rows but
-  # the batch has 85 protein tokens` on phospho-ubiquitin, so chai-1 could not
-  # be given its ESM2 embeddings on ANY PTM input -- and chai without them folds
-  # a different model (5.70 A where it reaches 0.642).
-  #
-  # Map each protein token to the row of ITS RESIDUE, which is AF3's own
-  # parent-residue convention for an atomised residue's restype. With nothing
-  # atomised every residue is one token and this is exactly the identity it
-  # replaces.
+  idxs = np.flatnonzero(np.asarray(batch['is_protein']).astype(bool))
   asym = np.asarray(batch['asym_id']).reshape(-1)[idxs]
   resi = np.asarray(batch['residue_index']).reshape(-1)[idxs]
-  rank, order = {}, []
-  for key in zip(asym.tolist(), resi.tolist()):
-    order.append(rank.setdefault(key, len(rank)))
-  if len(rows) == len(idxs):
+  if fold_input is None:
+    rank, order = {}, []
+    for key in zip(asym.tolist(), resi.tolist()):
+      order.append(rank.setdefault(key, len(rank)))
+    return idxs, np.asarray(order, np.int64), len(rank)
+
+  from alphafold3.common import folding_input as fi
+  asym_of = _chain_asym_ids(batch, fold_input)
+  sources, offset = {}, 0
+  for chain in fold_input.chains:
+    if not isinstance(chain, fi.ProteinChain):
+      continue
+    length = len(chain.sequence)
+    group = asym_of.get(str(chain.id))
+    if group is not None:
+      sources[group] = (offset, length)
+    # Dropped chains still occupy rows in the tower's concatenated output.
+    offset += length
+  order = []
+  for group, residue in zip(asym.tolist(), resi.tolist()):
+    if group not in sources:
+      raise ValueError(f'no input protein chain for batch asym_id {group}')
+    start, length = sources[group]
+    if not 1 <= residue <= length:
+      raise ValueError(f'residue {residue} outside input protein chain of length {length}')
+    order.append(start + residue - 1)
+  return idxs, np.asarray(order, np.int64), offset
+
+
+def _attach_esm(batch, esm, fold_input=None):
+  """Put ESM2 residue embeddings on protein tokens, zero elsewhere.
+
+  With fold_input, rows follow its protein chains, as esm.embed produces them.
+  Otherwise rows must already follow batch order; legacy per-token rows are
+  also accepted. Atomised tokens share their parent residue's row.
+  """
+  rows = np.asarray(esm, np.float32)
+  is_protein = np.asarray(batch['is_protein']).astype(bool)
+  out = np.zeros(is_protein.shape + (rows.shape[-1],), np.float32)
+  idxs, order, n_residues = _protein_lm_indices(batch, fold_input)
+  if len(rows) == n_residues:
+    out[idxs] = rows[order]
+  elif fold_input is None and len(rows) == len(idxs):
     out[idxs] = rows
-  elif len(rows) == len(rank):
-    out[idxs] = rows[np.asarray(order, np.int64)]
   else:
-    raise ValueError(f'esm has {len(rows)} rows but the batch has {len(idxs)} '
-                     f'protein tokens spanning {len(rank)} residues')
+    raise ValueError(f'esm has {len(rows)} rows but expected {n_residues} '
+                     f'protein residues for {len(idxs)} batch protein tokens')
   batch['esm_embeddings'] = out
   return batch
 
@@ -1632,18 +1685,27 @@ def _wide_key_window(batch, k_size, prefix=''):
   """
   return _key_window(batch, 'slide', k_size=k_size, prefix=prefix)
 
-def _attach_lm_pair(batch, lm_pair):
+def _attach_lm_pair(batch, lm_pair, fold_input=None):
   """ESMFold2's language-model PAIR representation, from alphafold3.model.esm.
 
-  (num_tokens, num_tokens, c_z), built outside the fold from ESM-C's hidden
-  states. It has to be in the SAME token order the featuriser laid out, which is
-  why it is keyed to the batch rather than to the input JSON.
+  With fold_input, both axes follow its protein residues, as lm_pair_for
+  produces them. Without it, a full pair array is already in batch token order,
+  or a protein-only array follows the batch's protein residue order.
 
   A pair rep covering only the protein tokens is scattered into the full token grid with zeros elsewhere. Native
   ESMFold2 instead runs its shim over every token, zero hidden states off protein; `_attach_lm_hidden` does that.
   """
   lm = np.asarray(lm_pair, np.float32)
   n = np.asarray(batch['token_index']).shape[-1]
+  if fold_input is not None:
+    idxs, rows, n_residues = _protein_lm_indices(batch, fold_input)
+    if lm.shape[:2] != (n_residues, n_residues):
+      raise ValueError(f'lm_pair is {lm.shape[:2]} but expected '
+                       f'{n_residues} input protein residues on both axes')
+    full = np.zeros((n, n, lm.shape[-1]), np.float32)
+    full[np.ix_(idxs, idxs)] = lm[np.ix_(rows, rows)]
+    batch['lm_pair'] = full
+    return batch
   real = int(np.asarray(batch.get('seq_mask', np.ones(n))).astype(bool).sum())
   if lm.shape[:2] == (real, real) and real < n:
     # every REAL token's pair rep (the harness's vendor states cover ligands too), the batch padded to a bucket:
@@ -1682,7 +1744,7 @@ def _attach_lm_pair(batch, lm_pair):
   return batch
 
 
-def _attach_lm_hidden(batch, rows, shim_params):
+def _attach_lm_hidden(batch, rows, shim_params, fold_input=None):
   """ESMFold2's language-model pair as native builds it: ESM-C's states (residues, layers, width) on every token,
   zeros where a token is not protein (and with no protein chain at all), then the shim over the whole token grid.
   A protein token takes its residue's row, which covers an atomised modified residue.
@@ -1694,15 +1756,11 @@ def _attach_lm_hidden(batch, rows, shim_params):
   hidden = np.zeros((n, layers, width), np.float32)
   idxs = np.flatnonzero(np.asarray(batch['is_protein']).astype(bool))
   if rows is not None and len(idxs):
-    asym = np.asarray(batch['asym_id']).reshape(-1)[idxs]
-    resi = np.asarray(batch['residue_index']).reshape(-1)[idxs]
-    rank, order = {}, []
-    for key in zip(asym.tolist(), resi.tolist()):
-      order.append(rank.setdefault(key, len(rank)))
-    if len(rows) != len(rank):
-      raise ValueError(f'ESM-C has {len(rows)} rows but the batch has {len(idxs)} protein tokens spanning '
-                       f'{len(rank)} residues')
-    hidden[idxs] = np.asarray(rows, np.float32)[np.asarray(order, np.int64)]
+    idxs, order, n_residues = _protein_lm_indices(batch, fold_input)
+    if len(rows) != n_residues:
+      raise ValueError(f'ESM-C has {len(rows)} rows but expected {n_residues} '
+                       f'protein residues for {len(idxs)} batch protein tokens')
+    hidden[idxs] = np.asarray(rows, np.float32)[order]
   batch['lm_pair'] = np.asarray(esm.shim(hidden, shim_params), np.float32)
   return batch
 
@@ -2162,7 +2220,8 @@ def _bioemu2_features(batch, fold_input, cyclic=None):
 
 
 def apply(batch, spec, *, refeaturise=None, model_dir=None, esm=None,
-          has_msa=True, fold_input=None, cyclic=None, lm_pair=None, seed=None, lm_hidden=None):
+          has_msa=True, fold_input=None, cyclic=None, lm_pair=None, seed=None, lm_hidden=None,
+          lm_pair_input_order=False):
   """Apply `spec`'s featurisation conventions to a featurised batch, in place.
 
   spec is a model_registry.ModelSpec; the work is driven by spec.featurise.
@@ -2181,7 +2240,9 @@ def apply(batch, spec, *, refeaturise=None, model_dir=None, esm=None,
   not the model declares anything.
 
   lm_hidden (ESM-C rows or None, shim params) builds ESMFold2's language-model pair over every token, as native
-  does; lm_pair is a finished one.
+  does; lm_pair is a finished one. With fold_input, esm/lm_hidden rows follow
+  its protein residue order, before cleaning. lm_pair retains its batch-order
+  contract unless lm_pair_input_order=True explicitly selects input residues.
   """
   knobs = spec.featurise
   check_constraints_supported(fold_input, spec)
@@ -2360,11 +2421,13 @@ def apply(batch, spec, *, refeaturise=None, model_dir=None, esm=None,
     aatype[:, other] = 21
     batch['template_aatype'] = aatype
   if knobs.get('lm_pair') and lm_hidden is not None:
-    _attach_lm_hidden(batch, *lm_hidden)
+    _attach_lm_hidden(batch, *lm_hidden, fold_input=fold_input)
   elif knobs.get('lm_pair') and lm_pair is not None:
-    _attach_lm_pair(batch, lm_pair)
+    if lm_pair_input_order and fold_input is None:
+      raise ValueError('lm_pair_input_order needs fold_input=')
+    _attach_lm_pair(batch, lm_pair, fold_input=fold_input if lm_pair_input_order else None)
   if knobs.get('esm') and esm is not None:
-    _attach_esm(batch, esm)
+    _attach_esm(batch, esm, fold_input=fold_input)
 
   if knobs.get('opendde'):
     if refeaturise is None:
@@ -2388,15 +2451,19 @@ def _modified_restype_protein_unknown(batch, fold_input, nucleic_unknown=False):
   asym = np.asarray(batch['asym_id']).reshape(-1)
   resi = np.asarray(batch['residue_index']).reshape(-1)
   aatype = np.array(batch['aatype'])
-  for index, chain in enumerate(fold_input.chains):
+  asym_of = _chain_asym_ids(batch, fold_input)
+  for chain in fold_input.chains:
     mods = (getattr(chain, 'ptms', None)
             or getattr(chain, 'modifications', None) or ())
     # helixfold3: a modified NUCLEOTIDE reads the nucleic unknown (30), which a DNA
     # token then carries as HelixFold3's DN (model.hf3_dn_columns)
     from alphafold3.common import folding_input as fi
     nucleic = nucleic_unknown and not isinstance(chain, fi.ProteinChain)
+    grp = asym_of.get(str(chain.id))
+    if grp is None:
+      continue                  # the cleaning dropped this chain
     for _code, residue in mods:
-      aatype[(asym == index + 1) & (resi == int(residue))] = 30 if nucleic else 20   # protein UNK
+      aatype[(asym == grp) & (resi == int(residue))] = 30 if nucleic else 20   # protein UNK
   batch['aatype'] = aatype
   return batch
 
@@ -2480,7 +2547,9 @@ def _of3_paired_query_row(batch, fold_input):
   from alphafold3.constants import residue_names
   gap = list(residue_names.POLYMER_TYPES_WITH_UNKNOWN_AND_GAP).index(residue_names.GAP)
   asym = np.asarray(batch['asym_id']).reshape(-1)
-  paired = [i + 1 for i, c in enumerate(fold_input.chains) if _has_alignment(getattr(c, 'paired_msa', None))]
+  asym_of = _chain_asym_ids(batch, fold_input)
+  paired = [grp for c in fold_input.chains if _has_alignment(getattr(c, 'paired_msa', None))
+            and (grp := asym_of.get(str(c.id))) is not None]
   unpaired_tok = ~np.isin(asym, paired)
   for k in ('msa', 'msa_mask', 'deletion_matrix'):
     if k not in batch:
@@ -2513,14 +2582,18 @@ def _modified_restype_protein_letter(batch, fold_input):
   aatype = np.array(batch['aatype'])
   msa = np.array(batch['msa']) if 'msa' in batch else None
   changed = False
-  for index, chain in enumerate(fold_input.chains):
+  asym_of = _chain_asym_ids(batch, fold_input)
+  for chain in fold_input.chains:
     mods = (getattr(chain, 'ptms', None)
             or getattr(chain, 'modifications', None) or ())
+    grp = asym_of.get(str(chain.id))
+    if grp is None:
+      continue                  # the cleaning dropped this chain
     for code, residue in mods:
       entry = ccd.get(code) or {}
       one = (entry.get('_chem_comp.one_letter_code') or ['X'])[0].upper()
       restype = letters.index(one) if one in letters else 20   # protein UNK
-      toks = np.flatnonzero((asym == index + 1) & (resi == int(residue)))
+      toks = np.flatnonzero((asym == grp) & (resi == int(residue)))
       aatype[toks] = restype
       if msa is not None:
         msa[0, toks] = restype
@@ -2546,12 +2619,16 @@ def _modified_self_bonds(batch, fold_input):
   """
   from alphafold3.constants import decoded_ccd
   ccd = decoded_ccd.get_ccd()
+  asym_of = _chain_asym_ids(batch, fold_input)
   code_of = {}
-  for index, chain in enumerate(fold_input.chains):
+  for chain in fold_input.chains:
+    grp = asym_of.get(str(chain.id))
+    if grp is None:
+      continue                  # the cleaning dropped this chain
     mods = (getattr(chain, 'ptms', None)
             or getattr(chain, 'modifications', None) or ())
     for code, residue in mods:
-      code_of[(index + 1, int(residue))] = code
+      code_of[(grp, int(residue))] = code
   residue_index = np.asarray(batch['residue_index'])
   asym_id = np.asarray(batch['asym_id'])
   chars = np.asarray(batch['ref_atom_name_chars'])
@@ -2608,7 +2685,8 @@ def _boltz_smiles_atom_names(batch, fold_input):
   asym_id = np.asarray(batch['asym_id'])
   chars = np.array(batch['ref_atom_name_chars'])
   mask = np.asarray(batch['ref_mask']).astype(bool)
-  for index, chain in enumerate(fold_input.chains):
+  asym_of = _chain_asym_ids(batch, fold_input)
+  for chain in fold_input.chains:
     smiles = getattr(chain, 'smiles', None)
     if not smiles:
       continue
@@ -2616,7 +2694,8 @@ def _boltz_smiles_atom_names(batch, fold_input):
     rank = list(AllChem.CanonicalRankAtoms(mol))
     names = [a.GetSymbol().upper() + str(rank[a.GetIdx()] + 1)
              for a in mol.GetAtoms() if a.GetAtomicNum() > 1]
-    tokens = np.flatnonzero(asym_id == index + 1)
+    grp = asym_of.get(str(chain.id))
+    tokens = np.flatnonzero(asym_id == grp) if grp is not None else np.array([], int)
     if len(tokens) != len(names):
       continue      # not one token per heavy atom; leave AF3's names alone
     for t, nm in zip(tokens, names):
@@ -2661,17 +2740,17 @@ def _smiles_bond_orders(batch, tokens, mol):
   batch['ligand_ligand_bond_order'] = orders
 
 
-def _modified_residue_positions(fold_input):
-  """-> {(asym_id, 1-based residue index)} of every modified polymer residue.
-
-  asym_id is 1-based and assigned in chain order, so chain i is asym_id i + 1.
-  """
+def _modified_residue_positions(fold_input, asym_of):
+  """Return (asym_id, 1-based residue index) for each retained modification."""
   positions = set()
-  for index, chain in enumerate(fold_input.chains):
+  for chain in fold_input.chains:
+    grp = asym_of.get(str(chain.id))
+    if grp is None:
+      continue                  # the cleaning dropped this chain
     mods = (getattr(chain, 'ptms', None)
             or getattr(chain, 'modifications', None) or ())
     for _code, residue in mods:
-      positions.add((index + 1, int(residue)))
+      positions.add((grp, int(residue)))
   return positions
 
 
@@ -2693,7 +2772,7 @@ def _mark_modified_residues(batch, fold_input, unknown_restype=False):
   """
   from alphafold3.constants import residue_names
 
-  wanted = _modified_residue_positions(fold_input)
+  wanted = _modified_residue_positions(fold_input, _chain_asym_ids(batch, fold_input))
   residue_index = np.asarray(batch['residue_index'])
   asym_id = np.asarray(batch['asym_id'])
   flag = np.zeros(residue_index.shape, np.int32)
@@ -2780,9 +2859,7 @@ def cyclic_period(batch, chains=True, fold_input=None):
   else:
     if fold_input is None:
       raise ValueError('naming cyclic chains by id needs fold_input=')
-    # asym_id is 1-based and assigned in chain order.
-    by_id = {chain.id: index + 1
-             for index, chain in enumerate(fold_input.chains)}
+    by_id = _chain_asym_ids(batch, fold_input)
     unknown = set(chains) - set(by_id)
     if unknown:
       raise ValueError(f'no chain(s) {sorted(unknown)} in this input; it has '
